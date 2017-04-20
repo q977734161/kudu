@@ -30,6 +30,7 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static org.apache.kudu.client.ExternalConsistencyMode.CLIENT_PROPAGATED;
 
 import java.net.UnknownHostException;
+import java.security.cert.CertificateException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -47,10 +48,12 @@ import javax.annotation.concurrent.GuardedBy;
 import javax.security.auth.Subject;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.net.HostAndPort;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
@@ -193,12 +196,13 @@ public class AsyncKuduClient implements AutoCloseable {
 
   private final RequestTracker requestTracker;
 
-  private final Subject subject;
+  private final SecurityContext securityContext;
 
   private volatile boolean closed;
 
   private AsyncKuduClient(AsyncKuduClientBuilder b) {
     this.channelFactory = b.createChannelFactory();
+    this.securityContext = new SecurityContext(b.subject);
     this.masterAddresses = b.masterAddresses;
     this.masterTable = new KuduTable(this, MASTER_TABLE_NAME_PLACEHOLDER,
         MASTER_TABLE_NAME_PLACEHOLDER, null, null);
@@ -210,7 +214,6 @@ public class AsyncKuduClient implements AutoCloseable {
     this.timer = b.timer;
     String clientId = UUID.randomUUID().toString().replace("-", "");
     this.requestTracker = new RequestTracker(clientId);
-    this.subject = b.subject;
     this.connectionCache = new ConnectionCache(this);
   }
 
@@ -510,6 +513,48 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
+   * Export serialized authentication data that may be passed to a different
+   * client instance and imported to provide that client the ability to connect
+   * to the cluster.
+   */
+  @InterfaceStability.Unstable
+  public Deferred<byte[]> exportAuthenticationCredentials() {
+    byte[] authnData = securityContext.exportAuthenticationCredentials();
+    if (authnData != null) {
+      return Deferred.fromResult(authnData);
+    }
+    // We have no authn data -- connect to the master, which will fetch
+    // new info.
+    return getMasterTableLocationsPB(null)
+        .addCallback(new MasterLookupCB(masterTable, null, 1))
+        .addCallback(new Callback<byte[], Object>() {
+          @Override
+          public byte[] call(Object ignored) {
+            // Connecting to the cluster should have also fetched the
+            // authn data.
+            return securityContext.exportAuthenticationCredentials();
+          }
+        });
+  }
+
+  /**
+   * Import data allowing this client to authenticate to the cluster.
+   * This will typically be used before making any connections to servers
+   * in the cluster.
+   *
+   * Note that, if this client has already been used by one user, this
+   * method cannot be used to switch authenticated users. Attempts to
+   * do so have undefined results, and may throw an exception.
+   *
+   * @param authnData then authentication data provided by a prior call to
+   * {@link #exportAuthenticationCredentials()}
+   */
+  @InterfaceStability.Unstable
+  public void importAuthenticationCredentials(byte[] authnData) {
+    securityContext.importAuthenticationCredentials(authnData);
+  }
+
+  /**
    * Get the timeout used for operations on sessions and scanners.
    * @return a timeout in milliseconds
    */
@@ -532,6 +577,14 @@ public class AsyncKuduClient implements AutoCloseable {
    */
   public long getDefaultSocketReadTimeoutMs() {
     return defaultSocketReadTimeoutMs;
+  }
+
+  /**
+   * @return the list of master addresses, stringified using commas to separate
+   * them
+   */
+  public String getMasterAddressesAsString() {
+    return Joiner.on(",").join(masterAddresses);
   }
 
   /**
@@ -565,6 +618,10 @@ public class AsyncKuduClient implements AutoCloseable {
 
   ClientSocketChannelFactory getChannelFactory() {
     return channelFactory;
+  }
+
+  SecurityContext getSecurityContext() {
+    return securityContext;
   }
 
   /**
@@ -626,8 +683,9 @@ public class AsyncKuduClient implements AutoCloseable {
           " will retry after a delay");
       return delayedSendRpcToTablet(nextRequest, new RecoverableException(statusRemoteError));
     }
+    Deferred<AsyncKuduScanner.Response> d = nextRequest.getDeferred();
     client.sendRpc(nextRequest);
-    return nextRequest.getDeferred();
+    return d;
   }
 
   /**
@@ -955,17 +1013,6 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
-   * Gets the subject who created the Kudu client.
-   *
-   * The subject contains credentials necessary to authenticate to Kerberized Kudu clusters.
-   *
-   * @return the subject who created the Kudu client, or null if no login context was active.
-   */
-  Subject getSubject() {
-    return subject;
-  }
-
-  /**
    * Clears {@link #tableLocations} of the table's entries.
    *
    * This method makes the maps momentarily inconsistent, and should only be
@@ -1067,8 +1114,34 @@ public class AsyncKuduClient implements AutoCloseable {
    * @return An initialized Deferred object to hold the response.
    */
   Deferred<Master.GetTableLocationsResponsePB> getMasterTableLocationsPB(KuduRpc<?> parentRpc) {
-    return ConnectToCluster.run(masterAddresses, parentRpc,
-        connectionCache, defaultAdminOperationTimeoutMs);
+    // TODO(todd): stop using this 'masterTable' hack.
+    return ConnectToCluster.run(masterTable, masterAddresses, parentRpc, connectionCache,
+        defaultAdminOperationTimeoutMs)
+        .addCallback(
+            new Callback<Master.GetTableLocationsResponsePB, ConnectToClusterResponse>() {
+              @Override
+              public Master.GetTableLocationsResponsePB call(ConnectToClusterResponse resp) {
+                // If the response has security info, adopt it.
+                if (resp.getConnectResponse().hasAuthnToken()) {
+                  securityContext.setAuthenticationToken(
+                      resp.getConnectResponse().getAuthnToken());
+                }
+                List<ByteString> caCerts = resp.getConnectResponse().getCaCertDerList();
+                if (!caCerts.isEmpty()) {
+                  try {
+                    securityContext.trustCertificates(caCerts);
+                  } catch (CertificateException e) {
+                    LOG.warn("Ignoring invalid CA cert from leader {}: {}",
+                        resp.getLeaderHostAndPort(),
+                        e.getMessage());
+                  }
+                }
+
+                // Translate the located master into a TableLocations
+                // since the rest of our locations caching code expects this type.
+                return resp.getAsTableLocations();
+              }
+            });
   }
 
   /**

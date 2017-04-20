@@ -47,6 +47,7 @@ using consensus::OpId;
 using fs::ReadableBlock;
 using log::ReadableLogSegment;
 using std::shared_ptr;
+using std::unique_ptr;
 using strings::Substitute;
 using tablet::TabletMetadata;
 using tablet::TabletPeer;
@@ -88,8 +89,8 @@ Status TabletCopySourceSession::Init() {
   // Anchor the data blocks by opening them and adding them to the cache.
   //
   // All subsequent requests should reuse the opened blocks.
-  vector<BlockIdPB> data_blocks;
-  TabletMetadata::CollectBlockIdPBs(tablet_superblock_, &data_blocks);
+  vector<BlockIdPB> data_blocks =
+      TabletMetadata::CollectBlockIdPBs(tablet_superblock_);
   for (const BlockIdPB& block_id : data_blocks) {
     VLOG(1) << "Opening block " << SecureDebugString(block_id);
     RETURN_NOT_OK(OpenBlockUnlocked(BlockId::FromPB(block_id)));
@@ -300,7 +301,7 @@ static Status AddImmutableFileToMap(Collection* const cache,
 Status TabletCopySourceSession::OpenBlockUnlocked(const BlockId& block_id) {
   session_lock_.AssertAcquired();
 
-  gscoped_ptr<ReadableBlock> block;
+  unique_ptr<ReadableBlock> block;
   Status s = fs_manager_->OpenBlock(block_id, &block);
   if (PREDICT_FALSE(!s.ok())) {
     LOG(WARNING) << "Unable to open requested (existing) block file: "

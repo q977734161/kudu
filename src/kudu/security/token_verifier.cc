@@ -17,6 +17,7 @@
 
 #include "kudu/security/token_verifier.h"
 
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -26,9 +27,11 @@
 #include "kudu/security/token.pb.h"
 #include "kudu/security/token_signing_key.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/logging.h"
 
 using std::lock_guard;
 using std::string;
+using std::transform;
 using std::unique_ptr;
 using std::vector;
 
@@ -52,11 +55,11 @@ int64_t TokenVerifier::GetMaxKnownKeySequenceNumber() const {
 
 // Import a set of public keys provided by the token signer (typically
 // running on another node).
-Status TokenVerifier::ImportPublicKeys(const vector<TokenSigningPublicKeyPB>& public_keys) {
+Status TokenVerifier::ImportKeys(const vector<TokenSigningPublicKeyPB>& keys) {
   // Do the construction outside of the lock, to avoid holding the
   // lock while doing lots of allocation.
   vector<unique_ptr<TokenSigningPublicKey>> tsks;
-  for (const auto& pb : public_keys) {
+  for (const auto& pb : keys) {
     // Sanity check the key.
     if (!pb.has_rsa_key_der()) {
       return Status::RuntimeError(
@@ -81,6 +84,18 @@ Status TokenVerifier::ImportPublicKeys(const vector<TokenSigningPublicKeyPB>& pu
   return Status::OK();
 }
 
+std::vector<TokenSigningPublicKeyPB> TokenVerifier::ExportKeys(
+    int64_t after_sequence_number) const {
+  vector<TokenSigningPublicKeyPB> ret;
+  shared_lock<RWMutex> l(lock_);
+  ret.reserve(keys_by_seq_.size());
+  transform(keys_by_seq_.upper_bound(after_sequence_number),
+            keys_by_seq_.end(),
+            back_inserter(ret),
+            [](const KeysMap::value_type& e) { return e.second->pb(); });
+  return ret;
+}
+
 // Verify the signature on the given token.
 VerificationResult TokenVerifier::VerifyTokenSignature(const SignedTokenPB& signed_token,
                                                        TokenPB* token) const {
@@ -102,6 +117,8 @@ VerificationResult TokenVerifier::VerifyTokenSignature(const SignedTokenPB& sign
 
   for (auto flag : token->incompatible_features()) {
     if (!TokenPB::Feature_IsValid(flag)) {
+      KLOG_EVERY_N_SECS(WARNING, 60) << "received authentication token with unknown feature; "
+                                        "server needs to be updated";
       return VerificationResult::INCOMPATIBLE_FEATURE;
     }
   }
@@ -121,6 +138,25 @@ VerificationResult TokenVerifier::VerifyTokenSignature(const SignedTokenPB& sign
   }
 
   return VerificationResult::VALID;
+}
+
+const char* VerificationResultToString(VerificationResult r) {
+  switch (r) {
+    case security::VerificationResult::VALID:
+      return "valid";
+    case security::VerificationResult::INVALID_TOKEN:
+      return "invalid authentication token";
+    case security::VerificationResult::INVALID_SIGNATURE:
+      return "invalid authentication token signature";
+    case security::VerificationResult::EXPIRED_TOKEN:
+      return "authentication token expired";
+    case security::VerificationResult::EXPIRED_SIGNING_KEY:
+      return "authentication token signing key expired";
+    case security::VerificationResult::UNKNOWN_SIGNING_KEY:
+      return "authentication token signed with unknown key";
+    case security::VerificationResult::INCOMPATIBLE_FEATURE:
+      return "authentication token uses incompatible feature";
+  }
 }
 
 } // namespace security

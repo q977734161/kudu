@@ -175,6 +175,7 @@ set(UTIL_SRCS
   rw_mutex.cc
   rwc_lock.cc
   ${SEMAPHORE_CC}
+  signal.cc
   slice.cc
   spinlock_profiling.cc
   status.cc
@@ -405,6 +406,7 @@ PROTOBUF_GENERATE_CPP(
   PROTO_FILES jsonwriter_test.proto)
 add_library(jsonwriter_test_proto ${JSONWRITER_TEST_PROTO_SRCS} ${JSONWRITER_TEST_PROTO_HDRS})
 target_link_libraries(jsonwriter_test_proto
+  pb_util_proto
   protobuf)
 
 #######################################

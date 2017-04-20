@@ -21,18 +21,19 @@
 #include <list>
 
 #include "kudu/cfile/cfile-test-base.h"
+#include "kudu/cfile/cfile.pb.h"
 #include "kudu/cfile/cfile_reader.h"
 #include "kudu/cfile/cfile_writer.h"
-#include "kudu/cfile/cfile.pb.h"
 #include "kudu/cfile/index_block.h"
 #include "kudu/cfile/index_btree.h"
 #include "kudu/common/columnblock.h"
 #include "kudu/fs/fs-test-util.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/stringprintf.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/metrics.h"
-#include "kudu/util/test_macros.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"
 
 DECLARE_string(block_cache_type);
 DECLARE_string(cfile_do_on_finish);
@@ -47,6 +48,8 @@ METRIC_DECLARE_counter(block_cache_hits_caching);
 METRIC_DECLARE_entity(server);
 
 using std::shared_ptr;
+using std::unique_ptr;
+using strings::Substitute;
 
 namespace kudu {
 namespace cfile {
@@ -64,9 +67,9 @@ class TestCFile : public CFileTestBase {
 
     WriteTestFile(&generator, encoding, NO_COMPRESSION, 10000, SMALL_BLOCKSIZE, &block_id);
 
-    gscoped_ptr<ReadableBlock> block;
+    unique_ptr<ReadableBlock> block;
     ASSERT_OK(fs_manager_->OpenBlock(block_id, &block));
-    gscoped_ptr<CFileReader> reader;
+    unique_ptr<CFileReader> reader;
     ASSERT_OK(CFileReader::Open(std::move(block), ReaderOptions(), &reader));
 
     BlockPointer ptr;
@@ -147,9 +150,9 @@ class TestCFile : public CFileTestBase {
   template <class DataGeneratorType>
   void TimeSeekAndReadFileWithNulls(DataGeneratorType* generator,
                                     const BlockId& block_id, size_t num_entries) {
-    gscoped_ptr<ReadableBlock> block;
+    unique_ptr<ReadableBlock> block;
     ASSERT_OK(fs_manager_->OpenBlock(block_id, &block));
-    gscoped_ptr<CFileReader> reader;
+    unique_ptr<CFileReader> reader;
     ASSERT_OK(CFileReader::Open(std::move(block), ReaderOptions(), &reader));
     ASSERT_EQ(DataGeneratorType::kDataType, reader->type_info()->type());
 
@@ -209,7 +212,7 @@ class TestCFile : public CFileTestBase {
 
   void TestReadWriteRawBlocks(CompressionType compression, int num_entries) {
     // Test Write
-    gscoped_ptr<WritableBlock> sink;
+    unique_ptr<WritableBlock> sink;
     ASSERT_OK(fs_manager_->CreateNewBlock(&sink));
     BlockId id = sink->id();
     WriterOptions opts;
@@ -230,9 +233,9 @@ class TestCFile : public CFileTestBase {
     ASSERT_OK(w.Finish());
 
     // Test Read
-    gscoped_ptr<ReadableBlock> source;
+    unique_ptr<ReadableBlock> source;
     ASSERT_OK(fs_manager_->OpenBlock(id, &source));
-    gscoped_ptr<CFileReader> reader;
+    unique_ptr<CFileReader> reader;
     ASSERT_OK(CFileReader::Open(std::move(source), ReaderOptions(), &reader));
 
     gscoped_ptr<IndexTreeIterator> iter;
@@ -290,6 +293,24 @@ class TestCFile : public CFileTestBase {
   }
 #endif
 
+  void TestWriteDictEncodingLowCardinalityStrings(int64_t num_rows) {
+    BlockId block_id;
+    LOG_TIMING(INFO, Substitute("writing $0 strings with dupes", num_rows)) {
+      LOG(INFO) << "Starting writefile";
+      // The second parameter specify how many distinct strings are there
+      DuplicateStringDataGenerator<false> generator("hello %zu", 256);
+      WriteTestFile(&generator, DICT_ENCODING, NO_COMPRESSION, num_rows, NO_FLAGS, &block_id);
+      LOG(INFO) << "Done writing";
+    }
+
+    LOG_TIMING(INFO, Substitute("reading $0 strings with dupes", num_rows)) {
+      LOG(INFO) << "Starting readfile";
+      size_t n;
+      TimeReadFile(fs_manager_.get(), block_id, &n);
+      ASSERT_EQ(num_rows, n);
+      LOG(INFO) << "End readfile";
+    }
+  }
 };
 
 // Subclass of TestCFile which is parameterized on the block cache type.
@@ -392,8 +413,12 @@ TEST_P(TestCFileBothCacheTypes, TestWrite100MFileStringsPrefixEncoding) {
   TestWrite100MFileStrings(PREFIX_ENCODING);
 }
 
-TEST_P(TestCFileBothCacheTypes, TestWrite100MFileStringsDictEncoding) {
+TEST_P(TestCFileBothCacheTypes, TestWrite100MUniqueStringsDictEncoding) {
   TestWrite100MFileStrings(DICT_ENCODING);
+}
+
+TEST_P(TestCFileBothCacheTypes, TestWrite100MLowCardinalityStringsDictEncoding) {
+  TestWriteDictEncodingLowCardinalityStrings(100 * 1e6);
 }
 
 TEST_P(TestCFileBothCacheTypes, TestWrite100MFileStringsPlainEncoding) {
@@ -422,24 +447,8 @@ TEST_P(TestCFileBothCacheTypes, TestWrite1MUniqueFileStringsDictEncoding) {
 }
 
 // Write and Read 1 million strings, which contains duplicates with dictionary encoding
-TEST_P(TestCFileBothCacheTypes, TestWrite1MDuplicateFileStringsDictEncoding) {
-  BlockId block_id;
-  LOG_TIMING(INFO, "writing 1M duplicate strings") {
-    LOG(INFO) << "Starting writefile";
-
-    // The second parameter specify how many distinct strings are there
-    DuplicateStringDataGenerator<false> generator("hello %zu", 256);
-    WriteTestFile(&generator, DICT_ENCODING, NO_COMPRESSION, 1000000, NO_FLAGS, &block_id);
-    LOG(INFO) << "Done writing";
-  }
-
-  LOG_TIMING(INFO, "reading 1M strings") {
-    LOG(INFO) << "Starting readfile";
-    size_t n;
-    TimeReadFile(fs_manager_.get(), block_id, &n);
-    ASSERT_EQ(1000000, n);
-    LOG(INFO) << "End readfile";
-  }
+TEST_P(TestCFileBothCacheTypes, TestWrite1MLowCardinalityStringsDictEncoding) {
+  TestWriteDictEncodingLowCardinalityStrings(1000000);
 }
 
 TEST_P(TestCFileBothCacheTypes, TestReadWriteUInt32) {
@@ -511,9 +520,9 @@ void TestCFile::TestReadWriteStrings(EncodingType encoding,
   WriteTestFile(&generator, encoding, NO_COMPRESSION, nrows,
                 SMALL_BLOCKSIZE | WRITE_VALIDX, &block_id);
 
-  gscoped_ptr<ReadableBlock> block;
+  unique_ptr<ReadableBlock> block;
   ASSERT_OK(fs_manager_->OpenBlock(block_id, &block));
-  gscoped_ptr<CFileReader> reader;
+  unique_ptr<CFileReader> reader;
   ASSERT_OK(CFileReader::Open(std::move(block), ReaderOptions(), &reader));
 
   rowid_t reader_nrows;
@@ -658,7 +667,7 @@ TEST_P(TestCFileBothCacheTypes, TestMetadata) {
 
   // Write the file.
   {
-    gscoped_ptr<WritableBlock> sink;
+    unique_ptr<WritableBlock> sink;
     ASSERT_OK(fs_manager_->CreateNewBlock(&sink));
     block_id = sink->id();
     WriterOptions opts;
@@ -676,9 +685,9 @@ TEST_P(TestCFileBothCacheTypes, TestMetadata) {
 
   // Read the file and ensure metadata is present.
   {
-    gscoped_ptr<ReadableBlock> source;
+    unique_ptr<ReadableBlock> source;
     ASSERT_OK(fs_manager_->OpenBlock(block_id, &source));
-    gscoped_ptr<CFileReader> reader;
+    unique_ptr<CFileReader> reader;
     ASSERT_OK(CFileReader::Open(std::move(source), ReaderOptions(), &reader));
     string val;
     ASSERT_TRUE(reader->GetMetadataEntry("key_in_header", &val));
@@ -783,7 +792,7 @@ TEST_P(TestCFileBothCacheTypes, TestNullDictStrings) {
 }
 
 TEST_P(TestCFileBothCacheTypes, TestReleaseBlock) {
-  gscoped_ptr<WritableBlock> sink;
+  unique_ptr<WritableBlock> sink;
   ASSERT_OK(fs_manager_->CreateNewBlock(&sink));
   ASSERT_EQ(WritableBlock::CLEAN, sink->state());
   WriterOptions opts;
@@ -821,17 +830,17 @@ TEST_P(TestCFileBothCacheTypes, TestLazyInit) {
   int64_t initial_mem_usage = tracker->consumption();
 
   // Open it using a "counting" readable block.
-  gscoped_ptr<ReadableBlock> block;
+  unique_ptr<ReadableBlock> block;
   ASSERT_OK(fs_manager_->OpenBlock(block_id, &block));
   size_t bytes_read = 0;
-  gscoped_ptr<ReadableBlock> count_block(
+  unique_ptr<ReadableBlock> count_block(
       new CountingReadableBlock(std::move(block), &bytes_read));
   ASSERT_EQ(initial_mem_usage, tracker->consumption());
 
   // Lazily opening the cfile should not trigger any reads.
   ReaderOptions opts;
   opts.parent_mem_tracker = tracker;
-  gscoped_ptr<CFileReader> reader;
+  unique_ptr<CFileReader> reader;
   ASSERT_OK(CFileReader::OpenNoInit(std::move(count_block), opts, &reader));
   ASSERT_EQ(0, bytes_read);
   int64_t lazy_mem_usage = tracker->consumption();
@@ -876,9 +885,9 @@ TEST_P(TestCFileBothCacheTypes, TestCacheKeysAreStable) {
 
   // Open and read from it twice, checking the block cache statistics.
   for (int i = 0; i < 2; i++) {
-    gscoped_ptr<ReadableBlock> source;
+    unique_ptr<ReadableBlock> source;
     ASSERT_OK(fs_manager_->OpenBlock(block_id, &source));
-    gscoped_ptr<CFileReader> reader;
+    unique_ptr<CFileReader> reader;
     ASSERT_OK(CFileReader::Open(std::move(source), ReaderOptions(), &reader));
 
     gscoped_ptr<IndexTreeIterator> iter;

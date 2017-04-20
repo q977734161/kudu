@@ -45,22 +45,22 @@ endif()
 # build/<first build directory>
 # build/<second build directory>
 # ...
-if ("${CMAKE_CURRENT_BINARY_DIR}" MATCHES "^${CMAKE_CURRENT_SOURCE_DIR}/build/[^/]+$")
-  if ("${CMAKE_CURRENT_BINARY_DIR}" MATCHES "^${CMAKE_CURRENT_SOURCE_DIR}/build/latest")
-    message(FATAL_ERROR "Should not run cmake inside the build/latest symlink. "
-            "First change directories into the destination of the symlink.")
-  endif()
-  if (NOT APPLE)
-    set(MORE_ARGS "-T")
-  endif()
-
+if ("${CMAKE_CURRENT_BINARY_DIR}" STREQUAL
+    "${CMAKE_CURRENT_SOURCE_DIR}/build/latest")
+  message(FATAL_ERROR "Should not run cmake inside the build/latest symlink. "
+    "First change directories into the destination of the symlink.")
+endif()
+string(REPLACE "${CMAKE_CURRENT_SOURCE_DIR}/build/" ""
+  BLESSED_BUILD_SUBDIR "${CMAKE_CURRENT_BINARY_DIR}")
+string(FIND "${BLESSED_BUILD_SUBDIR}" "/" SLASH_POS)
+if (SLASH_POS EQUAL -1)
   # Create the symlink both during cmake invocation and when the default target
   # ('all') is built. The former is useful for scripts that, after running
   # cmake, only build a single target (i.e. "make lint").
-  execute_process(COMMAND ln ${MORE_ARGS} -sf ${CMAKE_CURRENT_BINARY_DIR}
+  execute_process(COMMAND ln ${MORE_ARGS} -nsf ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/build/latest)
   add_custom_target(latest_symlink ALL
-    ln ${MORE_ARGS} -sf ${CMAKE_CURRENT_BINARY_DIR}
+    ln ${MORE_ARGS} -nsf ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/build/latest
     COMMENT "Recreating ../build/latest symlink")
 
@@ -183,7 +183,9 @@ set(CXX_FLAGS_FASTDEBUG "-ggdb -O1 -fno-omit-frame-pointer")
 set(CXX_FLAGS_RELEASE "-O3 -g -DNDEBUG -fno-omit-frame-pointer")
 
 if (NOT "${KUDU_USE_LTO}" STREQUAL "")
-  set(CXX_FLAGS_RELEASE "${CXX_FLAGS_RELEASE} flto -fno-use-linker-plugin")
+  set(CXX_FLAGS_RELEASE "${CXX_FLAGS_RELEASE} -flto -fuse-ld=lld")
+  set(CMAKE_AR "llvm-ar")
+  set(CMAKE_RANLIB "llvm-ranlib")
 endif()
 
 set(CXX_FLAGS_PROFILE_GEN "${CXX_FLAGS_RELEASE} -fprofile-generate")
@@ -246,9 +248,11 @@ if ("${COMPILER_FAMILY}" STREQUAL "clang")
   # This test is imperfect because 'cmake' and 'make' can be run independently
   # (with different terminal options), and we're testing during the former.
   #
-  # We also provide a manual override as -DKUDU_FORCE_COLOR_DIAGNOSTICS=1.
+  # We also provide a manual override as -DKUDU_FORCE_COLOR_DIAGNOSTICS=1 or
+  # by setting an environment variable of the same name.
   execute_process(COMMAND test -t 2 RESULT_VARIABLE KUDU_IS_TTY)
   if ((NOT "${KUDU_FORCE_COLOR_DIAGNOSTICS}" STREQUAL "") OR
+      (NOT "$ENV{KUDU_FORCE_COLOR_DIAGNOSTICS}" STREQUAL "") OR
       ((${KUDU_IS_TTY} EQUAL 0) AND (NOT ("$ENV{TERM}" STREQUAL "dumb"))))
     message("Running in a controlling terminal")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcolor-diagnostics")
@@ -1089,10 +1093,10 @@ endif (UNIX)
 if (UNIX)
   if (NOT DOXYGEN_FOUND)
     add_custom_target(site
-      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh)
+      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh --no-doxygen)
   else ()
     add_custom_target(site
-      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh doxygen)
+      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh)
   endif ()
 endif (UNIX)
 

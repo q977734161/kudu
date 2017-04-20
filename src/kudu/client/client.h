@@ -56,6 +56,7 @@ class PartitionSchema;
 namespace client {
 
 class KuduLoggingCallback;
+class KuduPartitioner;
 class KuduScanToken;
 class KuduSession;
 class KuduStatusCallback;
@@ -223,6 +224,15 @@ class KUDU_EXPORT KuduClientBuilder {
   ///   Timeout value to set.
   /// @return Reference to the updated object.
   KuduClientBuilder& default_rpc_timeout(const MonoDelta& timeout);
+
+  /// Import serialized authentication credentials from another client.
+  ///
+  /// @param [in] authn_creds
+  ///   The serialized authentication credentials, provided by a call to
+  ///   @c KuduClient.ExportAuthenticationCredentials in the C++ client or
+  ///   @c KuduClient#exportAuthenticationCredentials in the Java client.
+  /// @return Reference to the updated object.
+  KuduClientBuilder& import_authentication_credentials(std::string authn_creds);
 
   /// Create a client object.
   ///
@@ -477,6 +487,19 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   ///   Timestamp encoded in HybridTime format.
   void SetLatestObservedTimestamp(uint64_t ht_timestamp);
 
+  /// Export the current authentication credentials from this client. This includes
+  /// the necessary credentials to authenticate to the cluster, as well as to
+  /// authenticate the cluster to the client.
+  ///
+  /// The resulting binary string may be passed into a new C++ client via the
+  /// @c KuduClientBuilder::import_authentication_credentials method, or into a new
+  /// Java client via @c KuduClient#importAuthenticationCredentials.
+  ///
+  /// @param [out] authn_creds
+  ///   The resulting binary authentication credentials.
+  /// @return Status object for the operation.
+  Status ExportAuthenticationCredentials(std::string* authn_creds) const;
+
  private:
   class KUDU_NO_EXPORT Data;
 
@@ -489,6 +512,7 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class internal::WriteRpc;
   friend class ClientTest;
   friend class KuduClientBuilder;
+  friend class KuduPartitionerBuilder;
   friend class KuduScanner;
   friend class KuduScanToken;
   friend class KuduScanTokenBuilder;
@@ -955,6 +979,7 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   class KUDU_NO_EXPORT Data;
 
   friend class KuduClient;
+  friend class KuduPartitioner;
 
   KuduTable(const sp::shared_ptr<KuduClient>& client,
             const std::string& name,
@@ -1009,7 +1034,7 @@ class KUDU_EXPORT KuduTableAlterer {
   /// @param [in] name
   ///   Name of the column to alter.
   /// @return Pointer to the result ColumnSpec object. The alterer keeps
-  ///   owhership of the newly created object.
+  ///   ownership of the newly created object.
   KuduColumnSpec* AlterColumn(const std::string& name);
 
   /// Drops an existing column from the table.
@@ -1524,7 +1549,7 @@ class KUDU_EXPORT KuduSession : public sp::enable_shared_from_this<KuduSession> 
   /// @endcode
   /// ... @c callback_2 will be triggered once @c b has been inserted,
   /// regardless of whether @c a has completed or not. That means there might be
-  /// pending operations left in prior batches even after the the callback
+  /// pending operations left in prior batches even after the callback
   /// has been invoked to report on the flush status of the latest batch.
   ///
   /// @note This also means that, if FlushAsync is called twice in succession,
@@ -1545,7 +1570,7 @@ class KUDU_EXPORT KuduSession : public sp::enable_shared_from_this<KuduSession> 
   void FlushAsync(KuduStatusCallback* cb);
 
   /// @return Status of the session closure. In particular, an error is returned
-  ///   if there are unflushed or in-flight operations.
+  ///   if there are non-flushed or in-flight operations.
   Status Close() WARN_UNUSED_RESULT;
 
   /// Check if there are any pending operations in this session.
@@ -1843,7 +1868,7 @@ class KUDU_EXPORT KuduScanner {
   /// for an additional time-to-live (set by a configuration flag on
   /// the tablet server). This is useful if the interval in between
   /// NextBatch() calls is big enough that the remote scanner might be garbage
-  /// collected (default ttl is set to 60 secs.).
+  /// collected (default TTL is set to 60 secs.).
   /// This does not invalidate any previously fetched results.
   ///
   /// @return Operation result status. In particular, this method returns
@@ -2191,6 +2216,85 @@ class KUDU_EXPORT KuduScanTokenBuilder {
 
   DISALLOW_COPY_AND_ASSIGN(KuduScanTokenBuilder);
 };
+
+/// @brief Builder for Partitioner instances.
+class KUDU_EXPORT KuduPartitionerBuilder {
+ public:
+  /// Construct an instance of the class.
+  ///
+  /// @param [in] table
+  ///   The table whose rows should be partitioned.
+  explicit KuduPartitionerBuilder(sp::shared_ptr<KuduTable> table);
+  ~KuduPartitionerBuilder();
+
+  /// Set the timeout used for building the Partitioner object.
+  KuduPartitionerBuilder* SetBuildTimeout(MonoDelta timeout);
+
+  /// Create a KuduPartitioner object for the specified table.
+  ///
+  /// This fetches all of the partitioning information up front if it
+  /// is not already cached by the associated KuduClient object. Thus,
+  /// it may time out or have an error if the Kudu master is not accessible.
+  ///
+  /// @param [out] partitioner
+  ///   The resulting KuduPartitioner instance; caller gets ownership.
+  ///
+  /// @note If the KuduClient object associated with the table already has
+  /// some partition information cached (e.g. due to the construction of
+  /// other Partitioners, or due to normal read/write activity), the
+  /// resulting Partitioner will make use of that cached information.
+  /// This means that the resulting partitioner is not guaranteed to have
+  /// up-to-date partition information in the case that there has been
+  /// a recent change to the partitioning of the target table.
+  Status Build(KuduPartitioner** partitioner);
+ private:
+  class KUDU_NO_EXPORT Data;
+
+  // Owned.
+  Data* data_;
+
+  DISALLOW_COPY_AND_ASSIGN(KuduPartitionerBuilder);
+};
+
+/// A KuduPartitioner allows clients to determine the target partition of a
+/// row without actually performing a write. The set of partitions is eagerly
+/// fetched when the KuduPartitioner is constructed so that the actual partitioning
+/// step can be performed synchronously without any network trips.
+///
+/// @note Because this operates on a metadata snapshot retrieved at construction
+/// time, it will not reflect any metadata changes to the table that have occurred
+/// since its creation.
+///
+/// @warning This class is not thread-safe.
+class KUDU_EXPORT KuduPartitioner {
+ public:
+  ~KuduPartitioner();
+
+  /// Return the number of partitions known by this partitioner.
+  /// The partition indices returned by @c PartitionRow are guaranteed
+  /// to be less than this value.
+  int NumPartitions() const;
+
+  /// Determine the partition index that the given row falls into.
+  ///
+  /// @param [in] row
+  ///   The row to be partitioned.
+  /// @param [out] partition
+  ///   The resulting partition index, or -1 if the row falls into a
+  ///   non-covered range. The result will be less than @c NumPartitioons().
+  ///
+  /// @return Status OK if successful. May return a bad Status if the
+  /// provided row does not have all columns of the partition key
+  /// set.
+  Status PartitionRow(const KuduPartialRow& row, int* partition);
+ private:
+  class KUDU_NO_EXPORT Data;
+  friend class KuduPartitionerBuilder;
+
+  explicit KuduPartitioner(Data* data);
+  Data* data_; // Owned.
+};
+
 
 } // namespace client
 } // namespace kudu

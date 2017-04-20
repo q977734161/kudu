@@ -24,8 +24,8 @@
 
 #include <sasl/sasl.h>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/rpc/negotiation.h"
+#include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/sasl_helper.h"
@@ -55,9 +55,10 @@ class ServerNegotiation {
   // release_socket().
   //
   // The provided TlsContext must outlive this negotiation instance.
-  explicit ServerNegotiation(std::unique_ptr<Socket> socket,
-                             const security::TlsContext* tls_context,
-                             const security::TokenVerifier* token_verifier);
+  ServerNegotiation(std::unique_ptr<Socket> socket,
+                    const security::TlsContext* tls_context,
+                    const security::TokenVerifier* token_verifier,
+                    RpcEncryption encryption);
 
   // Enable PLAIN authentication.
   // Despite PLAIN authentication taking a username and password, we disregard
@@ -101,7 +102,11 @@ class ServerNegotiation {
 
   // Name of the user that was authenticated.
   // Must be called after a successful Negotiate().
-  const std::string& authenticated_user() const;
+  //
+  // Subsequent calls will return bogus data.
+  RemoteUser take_authenticated_user() {
+    return std::move(authenticated_user_);
+  }
 
   // Specify the fully-qualified domain name of the remote server.
   // Must be called before Negotiate(). Required for some mechanisms.
@@ -196,9 +201,6 @@ class ServerNegotiation {
   // Send a SASL_SUCCESS response to the client.
   Status SendSaslSuccess() WARN_UNUSED_RESULT;
 
-  // Encode the provided data and append it to 'encoded'.
-  Status SaslEncode(const std::string& plaintext, std::string* encoded) WARN_UNUSED_RESULT;
-
   // Receive and validate the ConnectionContextPB.
   Status RecvConnectionContext(faststring* recv_buf) WARN_UNUSED_RESULT;
 
@@ -207,12 +209,14 @@ class ServerNegotiation {
 
   // SASL state.
   std::vector<sasl_callback_t> callbacks_;
-  gscoped_ptr<sasl_conn_t, SaslDeleter> sasl_conn_;
+  std::unique_ptr<sasl_conn_t, SaslDeleter> sasl_conn_;
   SaslHelper helper_;
+  boost::optional<std::string> nonce_;
 
   // TLS state.
   const security::TlsContext* tls_context_;
   security::TlsHandshake tls_handshake_;
+  const RpcEncryption encryption_;
   bool tls_negotiated_;
 
   // TSK state.
@@ -224,7 +228,7 @@ class ServerNegotiation {
 
   // The successfully-authenticated user, if applicable. Filled in during
   // negotiation.
-  std::string authenticated_user_;
+  RemoteUser authenticated_user_;
 
   // The authentication type. Filled in during negotiation.
   AuthenticationType negotiated_authn_;

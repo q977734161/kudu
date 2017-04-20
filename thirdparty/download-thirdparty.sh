@@ -239,13 +239,16 @@ if [ ! -d $PYTHON_SOURCE ]; then
   fetch_and_expand python-${PYTHON_VERSION}.tar.gz
 fi
 
-LLVM_PATCHLEVEL=1
+LLVM_PATCHLEVEL=2
 delete_if_wrong_patchlevel $LLVM_SOURCE $LLVM_PATCHLEVEL
 if [ ! -d $LLVM_SOURCE ]; then
   fetch_and_expand llvm-${LLVM_VERSION}.src.tar.gz
 
   pushd $LLVM_SOURCE
   patch -p1 < $TP_DIR/patches/llvm-fix-amazon-linux.patch
+  pushd projects/libcxx
+  patch -p1 < $TP_DIR/patches/libc++-fix-std-once-barriers.patch
+  popd
   touch patchlevel-$LLVM_PATCHLEVEL
   popd
   echo
@@ -300,6 +303,16 @@ fi
 
 if [ ! -d "$BREAKPAD_SOURCE" ]; then
   fetch_and_expand breakpad-${BREAKPAD_VERSION}.tar.gz
+fi
+
+SPARSEHASH_PATCHLAVEL=2
+delete_if_wrong_patchlevel $SPARSEHASH_SOURCE $SPARSEHASH_PATCHLEVEL
+if [ ! -d "$SPARSEHASH_SOURCE" ]; then
+  fetch_and_expand sparsehash-c11-${SPARSEHASH_VERSION}.tar.gz
+  pushd $SPARSEHASH_SOURCE
+  patch -p1 < $TP_DIR/patches/sparsehash-0001-Add-compatibily-for-gcc-4.x-in-traits.patch
+  touch patchlevel-$SPARSEHASH_PATCHLAVEL
+  popd
 fi
 
 echo "---------------"

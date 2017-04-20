@@ -19,13 +19,17 @@
 
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <glog/stl_logging.h>
 
 #include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/map-util.h"
 
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
@@ -134,9 +138,11 @@ const string RowSetMetadata::ToString() const {
   return Substitute("RowSet($0)", id_);
 }
 
-void RowSetMetadata::SetColumnDataBlocks(const ColumnIdToBlockIdMap& blocks) {
+void RowSetMetadata::SetColumnDataBlocks(const std::map<ColumnId, BlockId>& blocks_by_col_id) {
+  ColumnIdToBlockIdMap new_map(blocks_by_col_id.begin(), blocks_by_col_id.end());
+  new_map.shrink_to_fit();
   std::lock_guard<LockType> l(lock_);
-  blocks_by_col_id_ = blocks;
+  blocks_by_col_id_ = std::move(new_map);
 }
 
 Status RowSetMetadata::CommitRedoDeltaDataBlock(int64_t dms_id,
@@ -186,6 +192,29 @@ Status RowSetMetadata::CommitUpdate(const RowSetMetadataUpdate& update) {
       redo_delta_blocks_.push_back(b);
     }
 
+    // Remove undo blocks.
+    BlockIdSet undos_to_remove(update.remove_undo_blocks_.begin(),
+                               update.remove_undo_blocks_.end());
+    int64_t num_removed = 0;
+    auto iter = undo_delta_blocks_.begin();
+    while (iter != undo_delta_blocks_.end()) {
+      if (ContainsKey(undos_to_remove, *iter)) {
+        removed.push_back(*iter);
+        undos_to_remove.erase(*iter);
+        iter = undo_delta_blocks_.erase(iter);
+        num_removed++;
+      } else {
+        ++iter;
+      }
+    }
+    CHECK(undos_to_remove.empty())
+        << "Tablet " << tablet_metadata_->tablet_id() << " RowSet " << id_ << ": "
+        << "Attempted to remove an undo delta block from the RowSetMetadata that is not present. "
+        << "Removed: { " << removed << " }; "
+        << "Failed to remove: { "
+        << vector<BlockId>(undos_to_remove.begin(), undos_to_remove.end())
+        << " }";
+
     if (!update.new_undo_block_.IsNull()) {
       // Front-loading to keep the UNDO files in their natural order.
       undo_delta_blocks_.insert(undo_delta_blocks_.begin(), update.new_undo_block_);
@@ -207,6 +236,8 @@ Status RowSetMetadata::CommitUpdate(const RowSetMetadataUpdate& update) {
       removed.push_back(old);
     }
   }
+
+  blocks_by_col_id_.shrink_to_fit();
 
   // Should only be NULL in tests.
   if (tablet_metadata()) {
@@ -256,6 +287,12 @@ RowSetMetadataUpdate& RowSetMetadataUpdate::ReplaceRedoDeltaBlocks(
 
   ReplaceDeltaBlocks rdb = { to_remove, to_add };
   replace_redo_blocks_.push_back(rdb);
+  return *this;
+}
+
+RowSetMetadataUpdate& RowSetMetadataUpdate::RemoveUndoDeltaBlocks(
+    const std::vector<BlockId>& to_remove) {
+  remove_undo_blocks_.insert(remove_undo_blocks_.end(), to_remove.begin(), to_remove.end());
   return *this;
 }
 

@@ -111,15 +111,17 @@ using kudu::consensus::GetNodeInstanceRequestPB;
 using kudu::consensus::GetNodeInstanceResponsePB;
 using kudu::consensus::LeaderStepDownRequestPB;
 using kudu::consensus::LeaderStepDownResponsePB;
+using kudu::consensus::UnsafeChangeConfigRequestPB;
+using kudu::consensus::UnsafeChangeConfigResponsePB;
 using kudu::consensus::RunLeaderElectionRequestPB;
 using kudu::consensus::RunLeaderElectionResponsePB;
 using kudu::consensus::StartTabletCopyRequestPB;
 using kudu::consensus::StartTabletCopyResponsePB;
 using kudu::consensus::VoteRequestPB;
 using kudu::consensus::VoteResponsePB;
-using kudu::rpc::ResultTracker;
 using kudu::rpc::RpcContext;
-using kudu::server::HybridClock;
+using kudu::rpc::RpcSidecar;
+using kudu::server::ServerBase;
 using kudu::tablet::AlterSchemaTransactionState;
 using kudu::tablet::Tablet;
 using kudu::tablet::TabletPeer;
@@ -513,8 +515,22 @@ TabletServiceImpl::TabletServiceImpl(TabletServer* server)
     server_(server) {
 }
 
-void TabletServiceImpl::Ping(const PingRequestPB* req,
-                             PingResponsePB* resp,
+bool TabletServiceImpl::AuthorizeClientOrServiceUser(const google::protobuf::Message* /*req*/,
+                                                 google::protobuf::Message* /*resp*/,
+                                                 rpc::RpcContext* rpc) {
+  return server_->Authorize(rpc, ServerBase::SUPER_USER | ServerBase::USER |
+                            ServerBase::SERVICE_USER);
+}
+
+bool TabletServiceImpl::AuthorizeClient(const google::protobuf::Message* /*req*/,
+                                        google::protobuf::Message* /*resp*/,
+                                        rpc::RpcContext* rpc) {
+  return server_->Authorize(rpc, ServerBase::SUPER_USER | ServerBase::USER);
+}
+
+
+void TabletServiceImpl::Ping(const PingRequestPB* /*req*/,
+                             PingResponsePB* /*resp*/,
                              rpc::RpcContext* context) {
   context->RespondSuccess();
 }
@@ -522,6 +538,12 @@ void TabletServiceImpl::Ping(const PingRequestPB* req,
 TabletServiceAdminImpl::TabletServiceAdminImpl(TabletServer* server)
   : TabletServerAdminServiceIf(server->metric_entity(), server->result_tracker()),
     server_(server) {
+}
+
+bool TabletServiceAdminImpl::AuthorizeServiceUser(const google::protobuf::Message* /*req*/,
+                                                  google::protobuf::Message* /*resp*/,
+                                                  rpc::RpcContext* rpc) {
+  return server_->Authorize(rpc, ServerBase::SUPER_USER | ServerBase::SERVICE_USER);
 }
 
 void TabletServiceAdminImpl::AlterSchema(const AlterSchemaRequestPB* req,
@@ -782,17 +804,22 @@ void TabletServiceImpl::Write(const WriteRequestPB* req,
                          TabletServerErrorPB::UNKNOWN_ERROR,
                          context);
   }
-  return;
 }
 
-ConsensusServiceImpl::ConsensusServiceImpl(const scoped_refptr<MetricEntity>& metric_entity,
-                                           const scoped_refptr<ResultTracker>& result_tracker,
+ConsensusServiceImpl::ConsensusServiceImpl(ServerBase* server,
                                            TabletPeerLookupIf* tablet_manager)
-  : ConsensusServiceIf(metric_entity, result_tracker),
-    tablet_manager_(tablet_manager) {
+    : ConsensusServiceIf(server->metric_entity(), server->result_tracker()),
+      server_(server),
+      tablet_manager_(tablet_manager) {
 }
 
 ConsensusServiceImpl::~ConsensusServiceImpl() {
+}
+
+bool ConsensusServiceImpl::AuthorizeServiceUser(const google::protobuf::Message* /*req*/,
+                                                google::protobuf::Message* /*resp*/,
+                                                rpc::RpcContext* rpc) {
+  return server_->Authorize(rpc, ServerBase::SUPER_USER | ServerBase::SERVICE_USER);
 }
 
 void ConsensusServiceImpl::UpdateConsensus(const ConsensusRequestPB* req,
@@ -855,7 +882,7 @@ void ConsensusServiceImpl::RequestConsensusVote(const VoteRequestPB* req,
 void ConsensusServiceImpl::ChangeConfig(const ChangeConfigRequestPB* req,
                                         ChangeConfigResponsePB* resp,
                                         RpcContext* context) {
-  DVLOG(3) << "Received ChangeConfig RPC: " << SecureDebugString(*req);
+  VLOG(2) << "Received ChangeConfig RPC: " << SecureDebugString(*req);
   if (!CheckUuidMatchOrRespond(tablet_manager_, "ChangeConfig", req, resp, context)) {
     return;
   }
@@ -874,6 +901,30 @@ void ConsensusServiceImpl::ChangeConfig(const ChangeConfigRequestPB* req,
     return;
   }
   // The success case is handled when the callback fires.
+}
+
+void ConsensusServiceImpl::UnsafeChangeConfig(const UnsafeChangeConfigRequestPB* req,
+                                              UnsafeChangeConfigResponsePB* resp,
+                                              RpcContext* context) {
+  VLOG(2) << "Received UnsafeChangeConfig RPC: " << SecureDebugString(*req);
+  if (!CheckUuidMatchOrRespond(tablet_manager_, "UnsafeChangeConfig", req, resp, context)) {
+    return;
+  }
+  scoped_refptr<TabletPeer> tablet_peer;
+  if (!LookupTabletPeerOrRespond(tablet_manager_, req->tablet_id(), resp, context,
+                                 &tablet_peer)) {
+    return;
+  }
+
+  scoped_refptr<Consensus> consensus;
+  if (!GetConsensusOrRespond(tablet_peer, resp, context, &consensus)) return;
+  TabletServerErrorPB::Code error_code;
+  Status s = consensus->UnsafeChangeConfig(*req, &error_code);
+  if (PREDICT_FALSE(!s.ok())) {
+    SetupErrorAndRespond(resp->mutable_error(), s, error_code, context);
+    return;
+  }
+  context->RespondSuccess();
 }
 
 void ConsensusServiceImpl::GetNodeInstance(const GetNodeInstanceRequestPB* req,
@@ -1017,10 +1068,11 @@ void TabletServiceImpl::ScannerKeepAlive(const ScannerKeepAliveRequestPB *req,
   DCHECK(req->has_scanner_id());
   SharedScanner scanner;
   if (!server_->scanner_manager()->LookupScanner(req->scanner_id(), &scanner)) {
-    resp->mutable_error()->set_code(TabletServerErrorPB::SCANNER_EXPIRED);
-    StatusToPB(Status::NotFound("Scanner not found"), resp->mutable_error()->mutable_status());
-    context->RespondSuccess();
-    return;
+      resp->mutable_error()->set_code(TabletServerErrorPB::SCANNER_EXPIRED);
+      StatusToPB(Status::NotFound("Scanner not found"),
+                 resp->mutable_error()->mutable_status());
+      context->RespondSuccess();
+      return;
   }
   scanner->UpdateAccessTime();
   context->RespondSuccess();
@@ -1049,8 +1101,8 @@ void TabletServiceImpl::Scan(const ScanRequestPB* req,
   }
 
   size_t batch_size_bytes = GetMaxBatchSizeBytesHint(req);
-  gscoped_ptr<faststring> rows_data(new faststring(batch_size_bytes * 11 / 10));
-  gscoped_ptr<faststring> indirect_data(new faststring(batch_size_bytes * 11 / 10));
+  unique_ptr<faststring> rows_data(new faststring(batch_size_bytes * 11 / 10));
+  unique_ptr<faststring> indirect_data(new faststring(batch_size_bytes * 11 / 10));
   RowwiseRowBlockPB data;
   ScanResultCopier collector(&data, rows_data.get(), indirect_data.get());
 
@@ -1099,15 +1151,15 @@ void TabletServiceImpl::Scan(const ScanRequestPB* req,
 
     // Add sidecar data to context and record the returned indices.
     int rows_idx;
-    CHECK_OK(context->AddRpcSidecar(make_gscoped_ptr(
-        new rpc::RpcSidecar(std::move(rows_data))), &rows_idx));
+    CHECK_OK(context->AddOutboundSidecar(RpcSidecar::FromFaststring((std::move(rows_data))),
+            &rows_idx));
     resp->mutable_data()->set_rows_sidecar(rows_idx);
 
     // Add indirect data as a sidecar, if applicable.
     if (indirect_data->size() > 0) {
       int indirect_idx;
-      CHECK_OK(context->AddRpcSidecar(make_gscoped_ptr(
-          new rpc::RpcSidecar(std::move(indirect_data))), &indirect_idx));
+      CHECK_OK(context->AddOutboundSidecar(RpcSidecar::FromFaststring(
+          std::move(indirect_data)), &indirect_idx));
       resp->mutable_data()->set_indirect_data_sidecar(indirect_idx);
     }
 

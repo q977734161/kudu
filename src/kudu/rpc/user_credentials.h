@@ -18,29 +18,21 @@
 
 #include <string>
 
-#include "kudu/gutil/macros.h"
-
 namespace kudu {
 namespace rpc {
 
-// Client-side user credentials, such as a user's username & password.
-// In the future, we will add Kerberos credentials.
-//
-// TODO(mpercy): this is actually used server side too -- should
-// we instead introduce a RemoteUser class or something?
+// Client-side user credentials. Currently this is more-or-less a simple wrapper
+// around a username string. However, we anticipate moving more credentials such as
+// tokens into a per-Proxy structure rather than Messenger-wide, and this will
+// be the place to store them.
 class UserCredentials {
  public:
-   UserCredentials();
-
   // Real user.
   bool has_real_user() const;
   void set_real_user(const std::string& real_user);
   const std::string& real_user() const { return real_user_; }
 
-  // Copy state from another object to this one.
-  void CopyFrom(const UserCredentials& other);
-
-  // Returns a string representation of the object, not including the password field.
+  // Returns a string representation of the object.
   std::string ToString() const;
 
   std::size_t HashCode() const;
@@ -49,8 +41,6 @@ class UserCredentials {
  private:
   // Remember to update HashCode() and Equals() when new fields are added.
   std::string real_user_;
-
-  DISALLOW_COPY_AND_ASSIGN(UserCredentials);
 };
 
 } // namespace rpc

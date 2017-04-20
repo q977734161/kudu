@@ -20,6 +20,7 @@
 #include <sys/time.h>
 #include <poll.h>
 
+#include <ostream>
 #include <string>
 
 #include <gflags/gflags.h>
@@ -35,6 +36,7 @@
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/server_negotiation.h"
+#include "kudu/security/tls_context.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
@@ -52,7 +54,8 @@ DEFINE_int32(rpc_negotiation_inject_delay_ms, 0,
              "the RPC negotiation process on the server side.");
 TAG_FLAG(rpc_negotiation_inject_delay_ms, unsafe);
 
-DECLARE_bool(server_require_kerberos);
+DECLARE_string(keytab_file);
+DECLARE_string(rpc_certificate_file);
 
 DEFINE_bool(rpc_encrypt_loopback_connections, false,
             "Whether to encrypt data transfer on RPC connections that stay within "
@@ -67,14 +70,18 @@ using strings::Substitute;
 namespace kudu {
 namespace rpc {
 
-std::ostream& operator<<(std::ostream& o, AuthenticationType authentication_type) {
-  switch (authentication_type) {
-    case AuthenticationType::INVALID: o << "INVALID"; break;
-    case AuthenticationType::SASL: o << "SASL"; break;
-    case AuthenticationType::TOKEN: o << "TOKEN"; break;
-    case AuthenticationType::CERTIFICATE: o << "CERTIFICATE"; break;
+const char* AuthenticationTypeToString(AuthenticationType t) {
+  switch (t) {
+    case AuthenticationType::INVALID: return "INVALID"; break;
+    case AuthenticationType::SASL: return "SASL"; break;
+    case AuthenticationType::TOKEN: return "TOKEN"; break;
+    case AuthenticationType::CERTIFICATE: return "CERTIFICATE"; break;
   }
-  return o;
+  return "<cannot reach here>";
+}
+
+std::ostream& operator<<(std::ostream& o, AuthenticationType authentication_type) {
+  return o << AuthenticationTypeToString(authentication_type);
 }
 
 // Wait for the client connection to be established and become ready for writing.
@@ -146,11 +153,15 @@ static Status DisableSocketTimeouts(Socket* socket) {
 }
 
 // Perform client negotiation. We don't LOG() anything, we leave that to our caller.
-static Status DoClientNegotiation(Connection* conn, MonoTime deadline) {
+static Status DoClientNegotiation(Connection* conn,
+                                  RpcAuthentication authentication,
+                                  RpcEncryption encryption,
+                                  MonoTime deadline) {
   const auto* messenger = conn->reactor_thread()->reactor()->messenger();
   ClientNegotiation client_negotiation(conn->release_socket(),
                                        &messenger->tls_context(),
-                                       messenger->authn_token());
+                                       messenger->authn_token(),
+                                       encryption);
 
   // Note that the fqdn is an IP address here: we've already lost whatever DNS
   // name the client was attempting to use. Unless krb5 is configured with 'rdns
@@ -158,23 +169,36 @@ static Status DoClientNegotiation(Connection* conn, MonoTime deadline) {
   // canonical hostname to determine the expected server principal.
   client_negotiation.set_server_fqdn(conn->remote().host());
 
-  Status s = client_negotiation.EnableGSSAPI();
-  if (!s.ok()) {
-    // If we can't enable GSSAPI, it's likely the client is just missing the
-    // appropriate SASL plugin. We don't want to require it to be installed
-    // if the user doesn't care about connecting to servers using Kerberos
-    // authentication. So, we'll just VLOG this here. If we try to connect
-    // to a server which requires Kerberos, we'll get a negotiation error
-    // at that point.
-    if (VLOG_IS_ON(1)) {
-      KLOG_FIRST_N(INFO, 1) << "Couldn't enable GSSAPI (Kerberos) SASL plugin: "
-                            << s.message().ToString()
-                            << ". This process will be unable to connect to "
-                            << "servers requiring Kerberos authentication.";
+  if (authentication != RpcAuthentication::DISABLED) {
+    Status s = client_negotiation.EnableGSSAPI();
+    if (!s.ok()) {
+      // If we can't enable GSSAPI, it's likely the client is just missing the
+      // appropriate SASL plugin. We don't want to require it to be installed
+      // if the user doesn't care about connecting to servers using Kerberos
+      // authentication. So, we'll just VLOG this here. If we try to connect
+      // to a server which requires Kerberos, we'll get a negotiation error
+      // at that point.
+      if (VLOG_IS_ON(1)) {
+        KLOG_FIRST_N(INFO, 1) << "Couldn't enable GSSAPI (Kerberos) SASL plugin: "
+                              << s.message().ToString()
+                              << ". This process will be unable to connect to "
+                              << "servers requiring Kerberos authentication.";
+      }
+
+      if (authentication == RpcAuthentication::REQUIRED &&
+          !messenger->authn_token() &&
+          !messenger->tls_context().has_signed_cert()) {
+        return Status::InvalidArgument(
+            "Kerberos, token, or PKI certificate credentials must be provided in order to "
+            "require authentication for a client");
+      }
     }
   }
 
-  RETURN_NOT_OK(client_negotiation.EnablePlain(conn->user_credentials().real_user(), ""));
+  if (authentication != RpcAuthentication::REQUIRED) {
+    RETURN_NOT_OK(client_negotiation.EnablePlain(conn->local_user_credentials().real_user(), ""));
+  }
+
   client_negotiation.set_deadline(deadline);
 
   RETURN_NOT_OK(WaitForClientConnect(client_negotiation.socket(), deadline));
@@ -190,7 +214,18 @@ static Status DoClientNegotiation(Connection* conn, MonoTime deadline) {
 }
 
 // Perform server negotiation. We don't LOG() anything, we leave that to our caller.
-static Status DoServerNegotiation(Connection* conn, const MonoTime& deadline) {
+static Status DoServerNegotiation(Connection* conn,
+                                  RpcAuthentication authentication,
+                                  RpcEncryption encryption,
+                                  const MonoTime& deadline) {
+  if (authentication == RpcAuthentication::REQUIRED &&
+      FLAGS_keytab_file.empty() &&
+      FLAGS_rpc_certificate_file.empty()) {
+    return Status::InvalidArgument("RPC authentication (--rpc_authentication) may not be "
+                                   "required unless Kerberos (--keytab_file) or external PKI "
+                                   "(--rpc_certificate_file et al) are configured");
+  }
+
   if (FLAGS_rpc_negotiation_inject_delay_ms > 0) {
     LOG(WARNING) << "Injecting " << FLAGS_rpc_negotiation_inject_delay_ms
                  << "ms delay in negotiation";
@@ -201,17 +236,19 @@ static Status DoServerNegotiation(Connection* conn, const MonoTime& deadline) {
   const auto* messenger = conn->reactor_thread()->reactor()->messenger();
   ServerNegotiation server_negotiation(conn->release_socket(),
                                        &messenger->tls_context(),
-                                       &messenger->token_verifier());
+                                       &messenger->token_verifier(),
+                                       encryption);
 
-  if (FLAGS_server_require_kerberos) {
+  if (authentication != RpcAuthentication::DISABLED && !FLAGS_keytab_file.empty()) {
     RETURN_NOT_OK(server_negotiation.EnableGSSAPI());
-  } else {
+  }
+  if (authentication != RpcAuthentication::REQUIRED) {
     RETURN_NOT_OK(server_negotiation.EnablePlain());
   }
+
   server_negotiation.set_deadline(deadline);
 
   RETURN_NOT_OK(server_negotiation.socket()->SetNonBlocking(false));
-
 
   RETURN_NOT_OK(server_negotiation.Negotiate());
   RETURN_NOT_OK(DisableSocketTimeouts(server_negotiation.socket()));
@@ -219,17 +256,20 @@ static Status DoServerNegotiation(Connection* conn, const MonoTime& deadline) {
   // Transfer the negotiated socket and state back to the connection.
   conn->adopt_socket(server_negotiation.release_socket());
   conn->set_remote_features(server_negotiation.take_client_features());
-  conn->mutable_user_credentials()->set_real_user(server_negotiation.authenticated_user());
+  conn->set_remote_user(server_negotiation.take_authenticated_user());
 
   return Status::OK();
 }
 
-void Negotiation::RunNegotiation(const scoped_refptr<Connection>& conn, MonoTime deadline) {
+void Negotiation::RunNegotiation(const scoped_refptr<Connection>& conn,
+                                 RpcAuthentication authentication,
+                                 RpcEncryption encryption,
+                                 MonoTime deadline) {
   Status s;
   if (conn->direction() == Connection::SERVER) {
-    s = DoServerNegotiation(conn.get(), deadline);
+    s = DoServerNegotiation(conn.get(), authentication, encryption, deadline);
   } else {
-    s = DoClientNegotiation(conn.get(), deadline);
+    s = DoClientNegotiation(conn.get(), authentication, encryption, deadline);
   }
 
   if (PREDICT_FALSE(!s.ok())) {

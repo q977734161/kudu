@@ -32,16 +32,17 @@
 #include "kudu/tools/tool_action.h"
 #include "kudu/util/flags.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/path_util.h"
 #include "kudu/util/status.h"
 
 DECLARE_bool(help);
 DECLARE_bool(helppackage);
 DECLARE_bool(helpshort);
 DECLARE_bool(helpxml);
-DECLARE_bool(log_redact_user_data);
 DECLARE_string(helpmatch);
 DECLARE_string(helpon);
 
+using std::cout;
 using std::cerr;
 using std::deque;
 using std::endl;
@@ -53,6 +54,23 @@ using strings::Substitute;
 
 namespace kudu {
 namespace tools {
+
+unique_ptr<Mode> RootMode(const string& name) {
+  return ModeBuilder(name)
+      .Description("Kudu Command Line Tools") // root mode description isn't printed
+      .AddMode(BuildClusterMode())
+      .AddMode(BuildFsMode())
+      .AddMode(BuildLocalReplicaMode())
+      .AddMode(BuildMasterMode())
+      .AddMode(BuildPbcMode())
+      .AddMode(BuildRemoteReplicaMode())
+      .AddMode(BuildTableMode())
+      .AddMode(BuildTabletMode())
+      .AddMode(BuildTestMode())
+      .AddMode(BuildTServerMode())
+      .AddMode(BuildWalMode())
+      .Build();
+}
 
 Status MarshalArgs(const vector<Mode*>& chain,
                    Action* action,
@@ -110,27 +128,24 @@ int DispatchCommand(const vector<Mode*>& chain,
 }
 
 // Replace hyphens with underscores in a string and return a copy.
-string HyphensToUnderscores(string str) {
+static string HyphensToUnderscores(string str) {
   std::replace(str.begin(), str.end(), '-', '_');
   return str;
 }
 
-int RunTool(int argc, char** argv, bool show_help) {
-  unique_ptr<Mode> root = ModeBuilder(argv[0])
-    .Description("doesn't matter") // root mode description isn't printed
-    .AddMode(BuildClusterMode())
-    .AddMode(BuildFsMode())
-    .AddMode(BuildLocalReplicaMode())
-    .AddMode(BuildMasterMode())
-    .AddMode(BuildPbcMode())
-    .AddMode(BuildRemoteReplicaMode())
-    .AddMode(BuildTableMode())
-    .AddMode(BuildTabletMode())
-    .AddMode(BuildTestMode())
-    .AddMode(BuildTServerMode())
-    .AddMode(BuildWalMode())
-    .Build();
+void DumpToolXML(const string& path) {
+  unique_ptr<Mode> root = RootMode(BaseName(path));
+  cout << "<?xml version=\"1.0\"?>";
+  cout << "<AllModes>";
+  for (const auto& mode : root->modes()) {
+    vector<Mode*> chain = { root.get(), mode.get() };
+    cout << mode->BuildHelpXML(chain);
+  }
+  cout << "</AllModes>" << endl;
+}
 
+int RunTool(int argc, char** argv, bool show_help) {
+  unique_ptr<Mode> root = RootMode(argv[0]);
   // Initialize arg parsing state.
   vector<Mode*> chain = { root.get() };
 
@@ -203,18 +218,23 @@ static bool ParseCommandLineFlags(int* argc, char*** argv) {
   // Inspired by https://github.com/gflags/gflags/issues/43#issuecomment-168280647.
   bool show_help = false;
   gflags::ParseCommandLineNonHelpFlags(argc, argv, true);
+
+  // Leverage existing helpxml flag to print mode/action xml.
+  if (FLAGS_helpxml) {
+    kudu::tools::DumpToolXML(*argv[0]);
+    exit(1);
+  }
+
   if (FLAGS_help ||
       FLAGS_helpshort ||
       !FLAGS_helpon.empty() ||
       !FLAGS_helpmatch.empty() ||
-      FLAGS_helppackage ||
-      FLAGS_helpxml) {
+      FLAGS_helppackage) {
     FLAGS_help = false;
     FLAGS_helpshort = false;
     FLAGS_helpon = "";
     FLAGS_helpmatch = "";
     FLAGS_helppackage = false;
-    FLAGS_helpxml = false;
     show_help = true;
   }
   kudu::HandleCommonFlags();
@@ -225,7 +245,7 @@ int main(int argc, char** argv) {
   // Disable redaction by default so that user data printed to the console will be shown
   // in full.
   CHECK_NE("",  google::SetCommandLineOptionWithMode(
-      "log_redact_user_data", "false", google::SET_FLAGS_DEFAULT));
+      "redact", "", google::SET_FLAGS_DEFAULT));
 
   FLAGS_logtostderr = true;
   bool show_help = ParseCommandLineFlags(&argc, &argv);

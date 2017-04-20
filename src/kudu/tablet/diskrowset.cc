@@ -15,10 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/tablet/diskrowset.h"
+
 #include <algorithm>
-#include <glog/logging.h>
+#include <map>
 #include <mutex>
 #include <vector>
+
+#include <glog/logging.h>
+#include <glog/stl_logging.h>
 
 #include "kudu/cfile/bloomfile.h"
 #include "kudu/cfile/cfile_writer.h"
@@ -33,7 +38,6 @@
 #include "kudu/tablet/compaction.h"
 #include "kudu/tablet/delta_compaction.h"
 #include "kudu/tablet/delta_store.h"
-#include "kudu/tablet/diskrowset.h"
 #include "kudu/tablet/multi_column_writer.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/flag_tags.h"
@@ -100,7 +104,7 @@ Status DiskRowSetWriter::Open() {
 
 Status DiskRowSetWriter::InitBloomFileWriter() {
   TRACE_EVENT0("tablet", "DiskRowSetWriter::InitBloomFileWriter");
-  gscoped_ptr<WritableBlock> block;
+  unique_ptr<WritableBlock> block;
   FsManager* fs = rowset_metadata_->fs_manager();
   RETURN_NOT_OK_PREPEND(fs->CreateNewBlock(&block),
                         "Couldn't allocate a block for bloom filter");
@@ -113,7 +117,7 @@ Status DiskRowSetWriter::InitBloomFileWriter() {
 
 Status DiskRowSetWriter::InitAdHocIndexWriter() {
   TRACE_EVENT0("tablet", "DiskRowSetWriter::InitAdHocIndexWriter");
-  gscoped_ptr<WritableBlock> block;
+  unique_ptr<WritableBlock> block;
   FsManager* fs = rowset_metadata_->fs_manager();
   RETURN_NOT_OK_PREPEND(fs->CreateNewBlock(&block),
                         "Couldn't allocate a block for compoound index");
@@ -185,7 +189,7 @@ Status DiskRowSetWriter::AppendBlock(const RowBlock &block) {
     }
 
 #ifndef NDEBUG
-    CHECK_LT(Slice(prev_key).compare(enc_key), 0)
+    CHECK(prev_key.size() == 0 || Slice(prev_key).compare(enc_key) < 0)
       << KUDU_REDACT(enc_key.ToDebugString()) << " appended to file not > previous key "
       << KUDU_REDACT(Slice(prev_key).ToDebugString());
 #endif
@@ -213,7 +217,6 @@ Status DiskRowSetWriter::FinishAndReleaseBlocks(ScopedWritableBlockCloser* close
   }
 
   // Save the last encoded (max) key
-  CHECK_GT(last_encoded_key_.size(), 0);
   Slice last_enc_slice(last_encoded_key_);
   std::string first_encoded_key =
       key_index_writer()->GetMetaValueOrDie(DiskRowSet::kMinKeyMetaEntryName);
@@ -228,7 +231,7 @@ Status DiskRowSetWriter::FinishAndReleaseBlocks(ScopedWritableBlockCloser* close
   RETURN_NOT_OK(col_writer_->FinishAndReleaseBlocks(closer));
 
   // Put the column data blocks in the metadata.
-  RowSetMetadata::ColumnIdToBlockIdMap flushed_blocks;
+  std::map<ColumnId, BlockId> flushed_blocks;
   col_writer_->GetFlushedBlocksByColumnId(&flushed_blocks);
   rowset_metadata_->SetColumnDataBlocks(flushed_blocks);
 
@@ -311,8 +314,8 @@ Status RollingDiskRowSetWriter::RollWriter() {
   RETURN_NOT_OK(cur_writer_->Open());
 
   FsManager* fs = tablet_metadata_->fs_manager();
-  gscoped_ptr<WritableBlock> undo_data_block;
-  gscoped_ptr<WritableBlock> redo_data_block;
+  unique_ptr<WritableBlock> undo_data_block;
+  unique_ptr<WritableBlock> redo_data_block;
   RETURN_NOT_OK(fs->CreateNewBlock(&undo_data_block));
   RETURN_NOT_OK(fs->CreateNewBlock(&redo_data_block));
   cur_undo_ds_block_id_ = undo_data_block->id();
@@ -515,6 +518,7 @@ Status DiskRowSet::MajorCompactDeltaStores(HistoryGcOpts history_gc_opts) {
   delta_tracker_->GetColumnIdsWithUpdates(&col_ids);
 
   if (col_ids.empty()) {
+    VLOG_WITH_PREFIX(2) << "There are no column ids with updates";
     return Status::OK();
   }
 
@@ -523,40 +527,46 @@ Status DiskRowSet::MajorCompactDeltaStores(HistoryGcOpts history_gc_opts) {
 
 Status DiskRowSet::MajorCompactDeltaStoresWithColumnIds(const vector<ColumnId>& col_ids,
                                                         HistoryGcOpts history_gc_opts) {
-  TRACE_EVENT0("tablet", "DiskRowSet::MajorCompactDeltaStores");
+  LOG_WITH_PREFIX(INFO) << "Major compacting REDO delta stores (cols: " << col_ids << ")";
+  TRACE_EVENT0("tablet", "DiskRowSet::MajorCompactDeltaStoresWithColumnIds");
   std::lock_guard<Mutex> l(*delta_tracker()->compact_flush_lock());
 
-  // TODO: do we need to lock schema or anything here?
+  // TODO(todd): do we need to lock schema or anything here?
   gscoped_ptr<MajorDeltaCompaction> compaction;
   RETURN_NOT_OK(NewMajorDeltaCompaction(col_ids, std::move(history_gc_opts), &compaction));
 
   RETURN_NOT_OK(compaction->Compact());
 
-  // Update and flush the metadata. This needs to happen before we make the new files visible to
-  // prevent inconsistencies after a server crash.
+  // Update the metadata.
   RowSetMetadataUpdate update;
   RETURN_NOT_OK(compaction->CreateMetadataUpdate(&update));
   RETURN_NOT_OK(rowset_metadata_->CommitUpdate(update));
-  RETURN_NOT_OK(rowset_metadata_->Flush());
 
-  // Make the new base data and delta files visible.
+  // Since we've already updated the metadata in memory, now we update the
+  // delta tracker's stores. Those stores should match the blocks in the
+  // metadata so, since we've already updated the metadata, we use CHECK_OK
+  // here.
   shared_ptr<CFileSet> new_base;
   RETURN_NOT_OK(CFileSet::Open(rowset_metadata_,
                                mem_trackers_.tablet_tracker,
                                &new_base));
   {
-    std::lock_guard<percpu_rwlock> lock(component_lock_);
-    RETURN_NOT_OK(compaction->UpdateDeltaTracker(delta_tracker_.get()));
+    std::lock_guard<rw_spinlock> lock(component_lock_);
+    CHECK_OK(compaction->UpdateDeltaTracker(delta_tracker_.get()));
     base_data_.swap(new_base);
   }
-  return Status::OK();
+
+  // We don't CHECK_OK on Flush here because if we don't successfully flush we
+  // don't have consistency problems in the case of major delta compaction --
+  // we are not adding additional mutations that weren't already present.
+  return rowset_metadata_->Flush();
 }
 
 Status DiskRowSet::NewMajorDeltaCompaction(const vector<ColumnId>& col_ids,
                                            HistoryGcOpts history_gc_opts,
                                            gscoped_ptr<MajorDeltaCompaction>* out) const {
   DCHECK(open_);
-  shared_lock<rw_spinlock> l(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_);
 
   const Schema* schema = &rowset_metadata_->tablet_schema();
 
@@ -584,7 +594,7 @@ Status DiskRowSet::NewRowIterator(const Schema *projection,
                                   OrderMode /*order*/,
                                   gscoped_ptr<RowwiseIterator>* out) const {
   DCHECK(open_);
-  shared_lock<rw_spinlock> l(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_);
 
   shared_ptr<CFileSet::Iterator> base_iter(base_data_->NewIterator(projection));
   gscoped_ptr<ColumnwiseIterator> col_iter;
@@ -608,7 +618,7 @@ Status DiskRowSet::MutateRow(Timestamp timestamp,
                              ProbeStats* stats,
                              OperationResultPB* result) {
   DCHECK(open_);
-  shared_lock<rw_spinlock> l(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_);
 
   rowid_t row_idx;
   RETURN_NOT_OK(base_data_->FindRow(probe, &row_idx, stats));
@@ -630,7 +640,7 @@ Status DiskRowSet::CheckRowPresent(const RowSetKeyProbe &probe,
                                    bool* present,
                                    ProbeStats* stats) const {
   DCHECK(open_);
-  shared_lock<rw_spinlock> l(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_);
 
   rowid_t row_idx;
   RETURN_NOT_OK(base_data_->CheckRowPresent(probe, present, &row_idx, stats));
@@ -648,7 +658,7 @@ Status DiskRowSet::CheckRowPresent(const RowSetKeyProbe &probe,
 
 Status DiskRowSet::CountRows(rowid_t *count) const {
   DCHECK(open_);
-  shared_lock<rw_spinlock> l(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_);
 
   return base_data_->CountRows(count);
 }
@@ -656,25 +666,25 @@ Status DiskRowSet::CountRows(rowid_t *count) const {
 Status DiskRowSet::GetBounds(std::string* min_encoded_key,
                              std::string* max_encoded_key) const {
   DCHECK(open_);
-  shared_lock<rw_spinlock> l(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_);
   return base_data_->GetBounds(min_encoded_key, max_encoded_key);
 }
 
 uint64_t DiskRowSet::EstimateBaseDataDiskSize() const {
   DCHECK(open_);
-  shared_lock<rw_spinlock> l(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_);
   return base_data_->EstimateOnDiskSize();
 }
 
 uint64_t DiskRowSet::EstimateDeltaDiskSize() const {
   DCHECK(open_);
-  shared_lock<rw_spinlock> l(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_);
   return delta_tracker_->EstimateOnDiskSize();
 }
 
 uint64_t DiskRowSet::EstimateOnDiskSize() const {
   DCHECK(open_);
-  shared_lock<rw_spinlock> l(component_lock_.get_lock());
+  shared_lock<rw_spinlock> l(component_lock_);
   return base_data_->EstimateOnDiskSize() + delta_tracker_->EstimateOnDiskSize();
 }
 
@@ -735,9 +745,30 @@ double DiskRowSet::DeltaStoresCompactionPerfImprovementScore(DeltaCompactionType
       perf_improv = static_cast<double>(store_count) / FLAGS_tablet_delta_store_minor_compact_max;
     }
   } else {
-    LOG(FATAL) << "Unknown delta compaction type " << type;
+    LOG_WITH_PREFIX(FATAL) << "Unknown delta compaction type " << type;
   }
   return std::min(1.0, perf_improv);
+}
+
+Status DiskRowSet::EstimateBytesInPotentiallyAncientUndoDeltas(Timestamp ancient_history_mark,
+                                                               int64_t* bytes) {
+  return delta_tracker_->EstimateBytesInPotentiallyAncientUndoDeltas(ancient_history_mark, bytes);
+}
+
+Status DiskRowSet::InitUndoDeltas(Timestamp ancient_history_mark,
+                                  MonoTime deadline,
+                                  int64_t* delta_blocks_initialized,
+                                  int64_t* bytes_in_ancient_undos) {
+  TRACE_EVENT0("tablet", "DiskRowSet::InitUndoDeltas");
+  return delta_tracker_->InitUndoDeltas(ancient_history_mark, deadline,
+                                        delta_blocks_initialized, bytes_in_ancient_undos);
+}
+
+Status DiskRowSet::DeleteAncientUndoDeltas(Timestamp ancient_history_mark,
+                                           int64_t* blocks_deleted, int64_t* bytes_deleted) {
+  TRACE_EVENT0("tablet", "DiskRowSet::DeleteAncientUndoDeltas");
+  return delta_tracker_->DeleteAncientUndoDeltas(ancient_history_mark,
+                                                 blocks_deleted, bytes_deleted);
 }
 
 Status DiskRowSet::DebugDump(vector<string> *lines) {

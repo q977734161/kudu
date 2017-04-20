@@ -92,8 +92,10 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
                              const TabletDataState& initial_tablet_data_state,
                              scoped_refptr<TabletMetadata>* metadata);
 
-  static void CollectBlockIdPBs(const TabletSuperBlockPB& superblock,
-                                std::vector<BlockIdPB>* block_ids);
+  static std::vector<BlockIdPB> CollectBlockIdPBs(
+      const TabletSuperBlockPB& superblock);
+
+  std::vector<BlockId> CollectBlockIds();
 
   const std::string& tablet_id() const {
     DCHECK_NE(state_, kNotLoadedYet);
@@ -328,7 +330,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   std::vector<Schema*> old_schemas_;
 
   // Protected by 'data_lock_'.
-  std::unordered_set<BlockId, BlockIdHash, BlockIdEqual> orphaned_blocks_;
+  BlockIdSet orphaned_blocks_;
 
   // The current state of tablet copy for the tablet.
   TabletDataState tablet_data_state_;

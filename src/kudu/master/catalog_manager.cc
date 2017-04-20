@@ -83,6 +83,10 @@
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/crypto.h"
+#include "kudu/security/tls_context.h"
+#include "kudu/security/token.pb.h"
+#include "kudu/security/token_signer.h"
+#include "kudu/security/token_signing_key.h"
 #include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/flag_tags.h"
@@ -197,6 +201,7 @@ DEFINE_bool(catalog_manager_delete_orphaned_tablets, false,
 TAG_FLAG(catalog_manager_delete_orphaned_tablets, advanced);
 
 using std::pair;
+using std::set;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
@@ -205,19 +210,24 @@ using std::vector;
 namespace kudu {
 namespace master {
 
-using base::subtle::NoBarrier_Load;
 using base::subtle::NoBarrier_CompareAndSwap;
+using base::subtle::NoBarrier_Load;
 using cfile::TypeEncodingInfo;
-using consensus::kMinimumTerm;
 using consensus::CONSENSUS_CONFIG_COMMITTED;
 using consensus::Consensus;
 using consensus::ConsensusServiceProxy;
 using consensus::ConsensusStatePB;
 using consensus::GetConsensusRole;
-using consensus::OpId;
 using consensus::RaftPeerPB;
 using consensus::StartTabletCopyRequestPB;
+using consensus::kMinimumTerm;
 using rpc::RpcContext;
+using security::Cert;
+using security::DataFormat;
+using security::PrivateKey;
+using security::TokenSigner;
+using security::TokenSigningPrivateKey;
+using security::TokenSigningPrivateKeyPB;
 using strings::Substitute;
 using tablet::TABLET_DATA_DELETED;
 using tablet::TABLET_DATA_TOMBSTONED;
@@ -317,6 +327,48 @@ class TabletLoader : public TabletVisitor {
 };
 
 ////////////////////////////////////////////////////////////
+// TSK (Token Signing Key) Entry Loader
+////////////////////////////////////////////////////////////
+
+class TskEntryLoader : public TskEntryVisitor {
+ public:
+  TskEntryLoader()
+      : entry_expiration_seconds_(WallTime_Now()) {
+  }
+
+  Status Visit(const string& entry_id,
+               const SysTskEntryPB& metadata) override {
+    TokenSigningPrivateKeyPB tsk(metadata.tsk());
+    CHECK(tsk.has_key_seq_num());
+    CHECK(tsk.has_expire_unix_epoch_seconds());
+    CHECK(tsk.has_rsa_key_der());
+
+    // Expired entries are useful as well: they are needed for correct tracking
+    // of TSK sequence numbers.
+    entries_.emplace_back(std::move(tsk));
+    if (tsk.expire_unix_epoch_seconds() <= entry_expiration_seconds_) {
+      expired_entry_ids_.insert(entry_id);
+    }
+    return Status::OK();
+  }
+
+  const vector<TokenSigningPrivateKeyPB>& entries() const {
+    return entries_;
+  }
+
+  const set<string>& expired_entry_ids() const {
+    return expired_entry_ids_;
+  }
+
+ private:
+  const int64_t entry_expiration_seconds_;
+  vector<TokenSigningPrivateKeyPB> entries_;
+  set<string> expired_entry_ids_;
+
+  DISALLOW_COPY_AND_ASSIGN(TskEntryLoader);
+};
+
+////////////////////////////////////////////////////////////
 // Background Tasks
 ////////////////////////////////////////////////////////////
 
@@ -400,9 +452,16 @@ void CatalogManagerBgTasks::Run() {
                        << l.catalog_status().ToString();
         }
       } else if (l.leader_status().ok()) {
-        std::vector<scoped_refptr<TabletInfo>> to_process;
+        // If this is the leader master, check if it's time to generate
+        // and store a new TSK (Token Signing Key).
+        Status s = catalog_manager_->CheckGenerateNewTskUnlocked();
+        if (!s.ok()) {
+          LOG(ERROR) << "Error processing TSK entry (will try next time): "
+                     << s.ToString();
+        }
 
         // Get list of tablets not yet running.
+        std::vector<scoped_refptr<TabletInfo>> to_process;
         catalog_manager_->ExtractTabletsToProcess(&to_process);
 
         if (!to_process.empty()) {
@@ -413,15 +472,14 @@ void CatalogManagerBgTasks::Run() {
             // If there is an error (e.g., we are not the leader) abort this task
             // and wait until we're woken up again.
             //
-            // TODO Add tests for this in the revision that makes
+            // TODO(unknown): Add tests for this in the revision that makes
             // create/alter fault tolerant.
-            LOG(ERROR) << "Error processing pending assignments, aborting the current task: "
-                       << s.ToString();
+            LOG(ERROR) << "Error processing pending assignments, "
+                "aborting the current task: " << s.ToString();
           }
         }
       }
     }
-
     // Wait for a notification or a timeout expiration.
     //  - CreateTable will call Wake() to notify about the tablets to add
     //  - HandleReportedTablet/ProcessPendingAssignments will call WakeIfHasPendingUpdates()
@@ -661,9 +719,9 @@ Status CatalogManager::ElectedAsLeaderCb() {
 }
 
 Status CatalogManager::WaitUntilCaughtUpAsLeader(const MonoDelta& timeout) {
-  string uuid = master_->fs_manager()->uuid();
-  Consensus* consensus = sys_catalog_->tablet_peer()->consensus();
-  ConsensusStatePB cstate = consensus->ConsensusState(CONSENSUS_CONFIG_COMMITTED);
+  ConsensusStatePB cstate = sys_catalog_->tablet_peer()->consensus()->
+      ConsensusState(CONSENSUS_CONFIG_COMMITTED);
+  const string& uuid = master_->fs_manager()->uuid();
   if (!cstate.has_leader_uuid() || cstate.leader_uuid() != uuid) {
     return Status::IllegalState(
         Substitute("Node $0 not leader. Consensus state: $1",
@@ -675,49 +733,64 @@ Status CatalogManager::WaitUntilCaughtUpAsLeader(const MonoDelta& timeout) {
   return Status::OK();
 }
 
-// Check if CA private key and the certificate were loaded into the
-// memory. If not, generate new ones and store them into the system table.
-// Use the CA information to initialize the certificate authority.
-Status CatalogManager::CheckInitCertAuthority() {
-  using security::Cert;
-  using security::DataFormat;
-  using security::PrivateKey;
-
+Status CatalogManager::LoadCertAuthorityInfo(unique_ptr<PrivateKey>* key,
+                                             unique_ptr<Cert>* cert) {
   leader_lock_.AssertAcquiredForWriting();
 
-  MasterCertAuthority* ca = master_->cert_authority();
+  SysCertAuthorityEntryPB info;
+  RETURN_NOT_OK(sys_catalog_->GetCertAuthorityEntry(&info));
+
   unique_ptr<PrivateKey> ca_private_key(new PrivateKey);
   unique_ptr<Cert> ca_cert(new Cert);
+  RETURN_NOT_OK(ca_private_key->FromString(
+      info.private_key(), DataFormat::DER));
+  RETURN_NOT_OK(ca_cert->FromString(
+      info.certificate(), DataFormat::DER));
+  // Extra sanity check.
+  RETURN_NOT_OK(ca_cert->CheckKeyMatch(*ca_private_key));
+
+  key->swap(ca_private_key);
+  cert->swap(ca_cert);
+
+  return Status::OK();
+}
+
+// Initialize the master's certificate authority component with the specified
+// private key and certificate.
+Status CatalogManager::InitCertAuthority(unique_ptr<PrivateKey> key,
+                                         unique_ptr<Cert> cert) {
+  leader_lock_.AssertAcquiredForWriting();
+  auto* ca = master_->cert_authority();
+  RETURN_NOT_OK_PREPEND(ca->Init(std::move(key), std::move(cert)),
+                        "could not init master CA");
+
+  auto* tls = master_->mutable_tls_context();
+  RETURN_NOT_OK_PREPEND(tls->AddTrustedCertificate(ca->ca_cert()),
+                        "could not trust master CA cert");
+  // If we haven't signed our own server cert yet, do so.
+  boost::optional<security::CertSignRequest> csr =
+      tls->GetCsrIfNecessary();
+  if (csr) {
+    Cert cert;
+    RETURN_NOT_OK_PREPEND(ca->SignServerCSR(*csr, &cert),
+                          "couldn't sign master cert with CA cert");
+    RETURN_NOT_OK_PREPEND(tls->AdoptSignedCert(cert),
+                          "couldn't adopt signed master cert");
+  }
+  return Status::OK();
+}
+
+// Store internal Kudu CA cert authority information into the system table.
+Status CatalogManager::StoreCertAuthorityInfo(const PrivateKey& key,
+                                              const Cert& cert) {
+  leader_lock_.AssertAcquiredForWriting();
 
   SysCertAuthorityEntryPB info;
-  const Status s = sys_catalog_->GetCertAuthorityEntry(&info);
-  if (!(s.ok() || s.IsNotFound())) {
-    return s;
-  }
-  if (PREDICT_TRUE(s.ok())) {
-    // The loaded data is necessary to initialize master's cert authority.
-    RETURN_NOT_OK(ca_private_key->FromString(
-        info.private_key(), DataFormat::DER));
-    RETURN_NOT_OK(ca_cert->FromString(
-        info.certificate(), DataFormat::DER));
-    // Extra sanity check.
-    RETURN_NOT_OK(ca_cert->CheckKeyMatch(*ca_private_key));
-  } else {
-    // Generate new private key and corresponding CA certificate.
-    RETURN_NOT_OK(ca->Generate(ca_private_key.get(), ca_cert.get()));
-    RETURN_NOT_OK(ca_private_key->ToString(
-        info.mutable_private_key(), DataFormat::DER));
-    RETURN_NOT_OK(ca_cert->ToString(
-        info.mutable_certificate(), DataFormat::DER));
-    // Store the newly generated private key and certificate
-    // in the system table.
-    RETURN_NOT_OK(sys_catalog_->AddCertAuthorityEntry(info));
-    LOG(INFO) << "Wrote cert authority information into the system table.";
-  }
-
-  // Initialize/re-initialize the master's certificate authority component
-  // with the new private key and certificate.
-  RETURN_NOT_OK(ca->Init(std::move(ca_private_key), std::move(ca_cert)));
+  RETURN_NOT_OK(key.ToString(info.mutable_private_key(), DataFormat::DER));
+  RETURN_NOT_OK(cert.ToString(info.mutable_certificate(), DataFormat::DER));
+  RETURN_NOT_OK(sys_catalog_->AddCertAuthorityEntry(info));
+  LOG(INFO) << "Successfully stored the newly generated cert authority "
+               "information into the system table.";
 
   return Status::OK();
 }
@@ -727,7 +800,7 @@ void CatalogManager::VisitTablesAndTabletsTask() {
     // Hack to block this function until InitSysCatalogAsync() is finished.
     shared_lock<LockType> l(lock_);
   }
-  Consensus* consensus = sys_catalog_->tablet_peer()->consensus();
+  const Consensus* consensus = sys_catalog_->tablet_peer()->consensus();
   int64_t term = consensus->ConsensusState(CONSENSUS_CONFIG_COMMITTED).current_term();
   {
     std::lock_guard<simple_spinlock> l(state_lock_);
@@ -772,12 +845,69 @@ void CatalogManager::VisitTablesAndTabletsTask() {
       CHECK_OK(VisitTablesAndTabletsUnlocked());
     }
 
-    // TODO(PKI): this should not be done in case of external PKI.
-    // TODO(PKI): should be there a flag to reset already existing CA info?
+    // TODO(KUDU-1920): this should not be done in case of external PKI.
+    // TODO(KUDU-1919): some kind of tool to rotate the IPKI CA
     LOG(INFO) << "Loading CA info into memory...";
     LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() +
                        "Loading CA info into memory") {
-      CHECK_OK(CheckInitCertAuthority());
+      unique_ptr<PrivateKey> key;
+      unique_ptr<Cert> cert;
+      const Status& s = LoadCertAuthorityInfo(&key, &cert);
+      if (s.ok()) {
+        // Once succesfully loaded, the CA information is supposed to be valid:
+        // the leader master should not be run without CA certificate.
+        CHECK_OK(InitCertAuthority(std::move(key), std::move(cert)));
+      } else if (s.IsNotFound()) {
+        LOG(INFO) << "Did not find CA certificate and key for Kudu IPKI, "
+                     "will generate new ones";
+        // No CA information record has been found in the table -- generate
+        // a new one. The subtlety here is that first it's necessary to store
+        // the newly generated information into the system table and only after
+        // that initialize master certificate authority. The reason is:
+        // if the master server loses its leadership role by that time, there
+        // will be an error on an attempt to write into the system table.
+        // If that happens, skip the rest of the sequence: when this callback
+        // is invoked next time, the system table should already contain
+        // CA certificate information written by other master.
+        unique_ptr<PrivateKey> private_key(new PrivateKey);
+        unique_ptr<Cert> cert(new Cert);
+
+        // Generate new private key and corresponding CA certificate.
+        CHECK_OK(master_->cert_authority()->Generate(private_key.get(),
+                                                     cert.get()));
+        // It the leadership role is lost at this moment, writing into the
+        // system table will fail.
+        const Status& s = StoreCertAuthorityInfo(*private_key, *cert);
+        if (s.ok()) {
+          // The leader master should not run without CA certificate.
+          CHECK_OK(InitCertAuthority(std::move(private_key), std::move(cert)));
+        } else {
+          LOG(WARNING) << "Failed to write newly generated CA information into "
+                          "the system table, assuming change of leadership: "
+                       << s.ToString();
+        }
+      } else {
+        CHECK_OK(s);
+      }
+    }
+
+    LOG(INFO) << "Loading token signing keys...";
+    LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() +
+                       "Loading token signing keys...") {
+      set<string> expired_tsk_entry_ids;
+      CHECK_OK(LoadTskEntries(&expired_tsk_entry_ids));
+      Status s = CheckGenerateNewTskUnlocked();
+      if (!s.ok()) {
+        LOG(WARNING) << "Failed to generate and persist new TSK, "
+                        "assuming change of leadership: " << s.ToString();
+        return;
+      }
+      s = DeleteTskEntries(expired_tsk_entry_ids);
+      if (!s.ok()) {
+        LOG(WARNING) << "Failed to purge expired TSK entries from system table, "
+                        "assuming change of leadership: " << s.ToString();
+        return;
+      }
     }
   }
 
@@ -843,8 +973,14 @@ bool CatalogManager::IsInitialized() const {
 }
 
 RaftPeerPB::Role CatalogManager::Role() const {
-  CHECK(IsInitialized());
-  return sys_catalog_->tablet_peer_->consensus()->role();
+  scoped_refptr<consensus::Consensus> consensus;
+  {
+    std::lock_guard<simple_spinlock> l(state_lock_);
+    if (state_ == kRunning) {
+      consensus = sys_catalog_->tablet_peer()->shared_consensus();
+    }
+  }
+  return consensus ? consensus->role() : RaftPeerPB::UNKNOWN_ROLE;
 }
 
 void CatalogManager::Shutdown() {
@@ -875,10 +1011,28 @@ void CatalogManager::Shutdown() {
   }
   AbortAndWaitForAllTasks(copy);
 
-  // Wait for any outstanding table visitors to finish.
+  // Shutdown the underlying consensus implementation. This aborts all pending
+  // operations on the system table. In case of a multi-master Kudu cluster,
+  // a deadlock might happen if the consensus implementation were active during
+  // further phases: shutting down the leader election pool and the system
+  // catalog.
+  //
+  // The mechanics behind the deadlock are as follows:
+  //   * The majority of the system table's peers goes down (e.g. all non-leader
+  //     masters shut down).
+  //   * The ElectedAsLeaderCb task issues an operation to the system
+  //     table (e.g. write newly generated TSK).
+  //   * The code below calls Shutdown() on the leader election pool. That
+  //     call does not return because the underlying Raft indefinitely
+  //     retries to get the response for the submitted operations.
+  if (sys_catalog_) {
+    sys_catalog_->tablet_peer()->consensus()->Shutdown();
+  }
+
+  // Wait for any outstanding ElectedAsLeaderCb tasks to finish.
   //
   // Must be done before shutting down the catalog, otherwise its tablet peer
-  // may be destroyed while still in use by a table visitor.
+  // may be destroyed while still in use by the ElectedAsLeaderCb task.
   leader_election_pool_->Shutdown();
 
   // Shut down the underlying storage for tables and tablets.
@@ -1436,11 +1590,6 @@ Status CatalogManager::ApplyAlterSchemaSteps(const SysTablesEntryPB& current_pb,
       case AlterTableRequestPB::RENAME_COLUMN: {
         if (!step.has_rename_column()) {
           return Status::InvalidArgument("RENAME_COLUMN missing column info");
-        }
-
-        // TODO: In theory we can rename a key
-        if (cur_schema.is_key_column(step.rename_column().old_name())) {
-          return Status::InvalidArgument("cannot rename a key column");
         }
 
         RETURN_NOT_OK(builder.RenameColumn(
@@ -2458,34 +2607,7 @@ class RetryingTSRpcTask : public MonitoredTask {
   }
 
   // Send the subclass RPC request.
-  Status Run() {
-    if (PREDICT_FALSE(FLAGS_catalog_manager_fail_ts_rpcs)) {
-      MarkFailed();
-      UnregisterAsyncTask(); // May delete this.
-      return Status::RuntimeError("Async RPCs configured to fail");
-    }
-
-    Status s = ResetTSProxy();
-    if (!s.ok()) {
-      LOG(WARNING) << "Unable to reset TS proxy: " << s.ToString();
-      MarkFailed();
-      UnregisterAsyncTask(); // May delete this.
-      return s.CloneAndPrepend("Failed to reset TS proxy");
-    }
-
-    // Calculate and set the timeout deadline.
-    MonoTime timeout = MonoTime::Now() +
-        MonoDelta::FromMilliseconds(FLAGS_master_ts_rpc_timeout_ms);
-    const MonoTime& deadline = MonoTime::Earliest(timeout, deadline_);
-    rpc_.set_deadline(deadline);
-
-    if (!SendRequest(++attempt_)) {
-      if (!RescheduleWithBackoffDelay()) {
-        UnregisterAsyncTask();  // May call 'delete this'.
-      }
-    }
-    return Status::OK();
-  }
+  Status Run();
 
   // Abort this task.
   virtual void Abort() OVERRIDE {
@@ -2539,22 +2661,7 @@ class RetryingTSRpcTask : public MonitoredTask {
   // Callback meant to be invoked from asynchronous RPC service proxy calls.
   //
   // Runs on a reactor thread, so should not block or do any IO.
-  void RpcCallback() {
-    if (!rpc_.status().ok()) {
-      LOG(WARNING) << "TS " << target_ts_desc_->ToString() << ": "
-                   << type_name() << " RPC failed for tablet "
-                   << tablet_id() << ": " << rpc_.status().ToString();
-    } else if (state() != kStateAborted) {
-      HandleResponse(attempt_); // Modifies state_.
-    }
-
-    // Schedule a retry if the RPC call was not successful.
-    if (RescheduleWithBackoffDelay()) {
-      return;
-    }
-
-    UnregisterAsyncTask();  // May call 'delete this'.
-  }
+  void RpcCallback();
 
   Master * const master_;
   const gscoped_ptr<TSPicker> replica_picker_;
@@ -2575,95 +2682,150 @@ class RetryingTSRpcTask : public MonitoredTask {
   // Returns false if the task was not rescheduled due to reaching the maximum
   // timeout or because the task is no longer in a running state.
   // Returns true if rescheduling the task was successful.
-  bool RescheduleWithBackoffDelay() {
-    if (state() != kStateRunning) return false;
-    MonoTime now = MonoTime::Now();
-    // We assume it might take 10ms to process the request in the best case,
-    // fail if we have less than that amount of time remaining.
-    int64_t millis_remaining = (deadline_ - now).ToMilliseconds() - 10;
-    // Exponential backoff with jitter.
-    int64_t base_delay_ms;
-    if (attempt_ <= 12) {
-      base_delay_ms = 1 << (attempt_ + 3);  // 1st retry delayed 2^4 ms, 2nd 2^5, etc.
-    } else {
-      base_delay_ms = 60 * 1000; // cap at 1 minute
-    }
-    int64_t jitter_ms = rand() % 50;              // Add up to 50ms of additional random delay.
-    int64_t delay_millis = std::min<int64_t>(base_delay_ms + jitter_ms, millis_remaining);
-
-    if (delay_millis <= 0) {
-      LOG(WARNING) << "Request timed out: " << description();
-      MarkFailed();
-    } else {
-      LOG(INFO) << "Scheduling retry of " << description() << " with a delay"
-                << " of " << delay_millis << "ms (attempt = " << attempt_ << ")...";
-      master_->messenger()->ScheduleOnReactor(
-          boost::bind(&RetryingTSRpcTask::RunDelayedTask, this, _1),
-          MonoDelta::FromMilliseconds(delay_millis));
-      return true;
-    }
-    return false;
-  }
+  bool RescheduleWithBackoffDelay();
 
   // Callback for Reactor delayed task mechanism. Called either when it is time
   // to execute the delayed task (with status == OK) or when the task
   // is cancelled, i.e. when the scheduling timer is shut down (status != OK).
-  void RunDelayedTask(const Status& status) {
-    if (!status.ok()) {
-      LOG(WARNING) << "Async tablet task " << description() << " failed or was cancelled: "
-                   << status.ToString();
-      UnregisterAsyncTask();   // May delete this.
-      return;
-    }
-
-    string desc = description();  // Save in case we need to log after deletion.
-    Status s = Run();             // May delete this.
-    if (!s.ok()) {
-      LOG(WARNING) << "Async tablet task " << desc << " failed: " << s.ToString();
-    }
-  }
+  void RunDelayedTask(const Status& status);
 
   // Clean up request and release resources. May call 'delete this'.
-  void UnregisterAsyncTask() {
-    end_ts_ = MonoTime::Now();
-    if (table_ != nullptr) {
-      table_->RemoveTask(this);
-    } else {
-      // This is a floating task (since the table does not exist)
-      // created as response to a tablet report.
-      Release();  // May call "delete this";
-    }
-  }
+  void UnregisterAsyncTask();
 
-  Status ResetTSProxy() {
-    // TODO: if there is no replica available, should we still keep the task running?
-    string ts_uuid;
-    RETURN_NOT_OK(replica_picker_->PickReplica(&ts_uuid));
-    shared_ptr<TSDescriptor> ts_desc;
-    if (!master_->ts_manager()->LookupTSByUUID(ts_uuid, &ts_desc)) {
-      return Status::NotFound(Substitute("Could not find TS for UUID $0",
-                                         ts_uuid));
-    }
-
-    // This assumes that TSDescriptors are never deleted by the master,
-    // so the task need not take ownership of the returned pointer.
-    target_ts_desc_ = ts_desc.get();
-
-    shared_ptr<tserver::TabletServerAdminServiceProxy> ts_proxy;
-    RETURN_NOT_OK(target_ts_desc_->GetTSAdminProxy(master_->messenger(), &ts_proxy));
-    ts_proxy_.swap(ts_proxy);
-
-    shared_ptr<consensus::ConsensusServiceProxy> consensus_proxy;
-    RETURN_NOT_OK(target_ts_desc_->GetConsensusProxy(master_->messenger(), &consensus_proxy));
-    consensus_proxy_.swap(consensus_proxy);
-
-    rpc_.Reset();
-    return Status::OK();
-  }
+  // Find a new replica and construct the RPC proxy.
+  Status ResetTSProxy();
 
   // Use state() and MarkX() accessors.
   AtomicWord state_;
 };
+
+Status RetryingTSRpcTask::Run() {
+  if (PREDICT_FALSE(FLAGS_catalog_manager_fail_ts_rpcs)) {
+    MarkFailed();
+    UnregisterAsyncTask(); // May delete this.
+    return Status::RuntimeError("Async RPCs configured to fail");
+  }
+
+  Status s = ResetTSProxy(); // This can fail if it's a replica we don't know about yet.
+  if (!s.ok()) {
+    MarkFailed();
+    UnregisterAsyncTask(); // May delete this.
+    return s.CloneAndPrepend("Failed to reset TS proxy");
+  }
+
+  // Calculate and set the timeout deadline.
+  MonoTime timeout = MonoTime::Now() +
+      MonoDelta::FromMilliseconds(FLAGS_master_ts_rpc_timeout_ms);
+  const MonoTime& deadline = MonoTime::Earliest(timeout, deadline_);
+  rpc_.set_deadline(deadline);
+
+  if (!SendRequest(++attempt_)) {
+    if (!RescheduleWithBackoffDelay()) {
+      UnregisterAsyncTask();  // May call 'delete this'.
+    }
+  }
+  return Status::OK();
+}
+
+void RetryingTSRpcTask::RpcCallback() {
+  if (!rpc_.status().ok()) {
+    LOG(WARNING) << "TS " << target_ts_desc_->ToString() << ": "
+                  << type_name() << " RPC failed for tablet "
+                  << tablet_id() << ": " << rpc_.status().ToString();
+  } else if (state() != kStateAborted) {
+    HandleResponse(attempt_); // Modifies state_.
+  }
+
+  // Schedule a retry if the RPC call was not successful.
+  if (RescheduleWithBackoffDelay()) {
+    return;
+  }
+
+  UnregisterAsyncTask();  // May call 'delete this'.
+}
+
+bool RetryingTSRpcTask::RescheduleWithBackoffDelay() {
+  if (state() != kStateRunning) return false;
+  MonoTime now = MonoTime::Now();
+  // We assume it might take 10ms to process the request in the best case,
+  // fail if we have less than that amount of time remaining.
+  int64_t millis_remaining = (deadline_ - now).ToMilliseconds() - 10;
+  // Exponential backoff with jitter.
+  int64_t base_delay_ms;
+  if (attempt_ <= 12) {
+    base_delay_ms = 1 << (attempt_ + 3);  // 1st retry delayed 2^4 ms, 2nd 2^5, etc.
+  } else {
+    base_delay_ms = 60 * 1000; // cap at 1 minute
+  }
+  int64_t jitter_ms = rand() % 50;              // Add up to 50ms of additional random delay.
+  int64_t delay_millis = std::min<int64_t>(base_delay_ms + jitter_ms, millis_remaining);
+
+  if (delay_millis <= 0) {
+    LOG(WARNING) << "Request timed out: " << description();
+    MarkFailed();
+  } else {
+    LOG(INFO) << "Scheduling retry of " << description() << " with a delay"
+              << " of " << delay_millis << "ms (attempt = " << attempt_ << ")...";
+    master_->messenger()->ScheduleOnReactor(
+        boost::bind(&RetryingTSRpcTask::RunDelayedTask, this, _1),
+        MonoDelta::FromMilliseconds(delay_millis));
+    return true;
+  }
+  return false;
+}
+
+void RetryingTSRpcTask::RunDelayedTask(const Status& status) {
+  if (!status.ok()) {
+    LOG(WARNING) << "Async tablet task " << description() << " failed or was cancelled: "
+                  << status.ToString();
+    UnregisterAsyncTask();   // May delete this.
+    return;
+  }
+
+  string desc = description();  // Save in case we need to log after deletion.
+  Status s = Run();             // May delete this.
+  if (!s.ok()) {
+    LOG(WARNING) << "Async tablet task " << desc << " failed: " << s.ToString();
+  }
+}
+
+void RetryingTSRpcTask::UnregisterAsyncTask() {
+  end_ts_ = MonoTime::Now();
+  if (table_ != nullptr) {
+    table_->RemoveTask(this);
+  } else {
+    // This is a floating task (since the table does not exist)
+    // created as response to a tablet report.
+    Release();  // May call "delete this";
+  }
+}
+
+Status RetryingTSRpcTask::ResetTSProxy() {
+  // TODO: if there is no replica available, should we still keep the task running?
+  string ts_uuid;
+  // TODO: don't pick replica we can't lookup???
+  RETURN_NOT_OK(replica_picker_->PickReplica(&ts_uuid));
+  shared_ptr<TSDescriptor> ts_desc;
+  if (!master_->ts_manager()->LookupTSByUUID(ts_uuid, &ts_desc)) {
+    return Status::NotFound(Substitute("Could not find TS for UUID $0",
+                                        ts_uuid));
+  }
+
+  // This assumes that TSDescriptors are never deleted by the master,
+  // so the task need not take ownership of the returned pointer.
+  target_ts_desc_ = ts_desc.get();
+
+  shared_ptr<tserver::TabletServerAdminServiceProxy> ts_proxy;
+  RETURN_NOT_OK(target_ts_desc_->GetTSAdminProxy(master_->messenger(), &ts_proxy));
+  ts_proxy_.swap(ts_proxy);
+
+  shared_ptr<consensus::ConsensusServiceProxy> consensus_proxy;
+  RETURN_NOT_OK(target_ts_desc_->GetConsensusProxy(master_->messenger(), &consensus_proxy));
+  consensus_proxy_.swap(consensus_proxy);
+
+  rpc_.Reset();
+  return Status::OK();
+}
 
 // RetryingTSRpcTask subclass which always retries the same tablet server,
 // identified by its UUID.
@@ -2989,6 +3151,9 @@ class AsyncAddServerTask : public RetryingTSRpcTask {
 };
 
 bool AsyncAddServerTask::SendRequest(int attempt) {
+  LOG(INFO) << "Sending request for AddServer on tablet " << tablet_->tablet_id()
+            << " (attempt " << attempt << ")";
+
   // Bail if we're retrying in vain.
   int64_t latest_index;
   {
@@ -3040,7 +3205,7 @@ bool AsyncAddServerTask::SendRequest(int attempt) {
 void AsyncAddServerTask::HandleResponse(int attempt) {
   if (!resp_.has_error()) {
     MarkComplete();
-    LOG_WITH_PREFIX(INFO) << "Change config succeeded";
+    LOG_WITH_PREFIX(INFO) << "Config change to add server succeeded";
     return;
   }
 
@@ -3131,18 +3296,18 @@ void CatalogManager::SendDeleteReplicaRequest(
     // created as response to a tablet report.
     call->AddRef();
   }
-  WARN_NOT_OK(call->Run(), "Failed to send delete tablet request");
+  WARN_NOT_OK(call->Run(),
+              Substitute("Failed to send DeleteReplica request for tablet $0", tablet_id));
 }
 
 void CatalogManager::SendAddServerRequest(const scoped_refptr<TabletInfo>& tablet,
                                           const ConsensusStatePB& cstate) {
   auto task = new AsyncAddServerTask(master_, tablet, cstate);
   tablet->table()->AddTask(task);
-  WARN_NOT_OK(task->Run(), "Failed to send new AddServer request");
-
-  // We can't access 'task' here because it may delete itself inside Run() in the
-  // case that the tablet has no known leader.
-  LOG(INFO) << "Started AddServer task for tablet " << tablet->tablet_id();
+  WARN_NOT_OK(task->Run(),
+              Substitute("Failed to send AddServer request for tablet $0", tablet->tablet_id()));
+  // We can't access 'task' after calling Run() because it may delete itself
+  // inside Run() in the case that the tablet has no known leader.
 }
 
 void CatalogManager::ExtractTabletsToProcess(
@@ -3175,6 +3340,47 @@ void CatalogManager::ExtractTabletsToProcess(
       tablets_to_process->push_back(tablet);
     }
   }
+}
+
+// Check if it's time to roll TokenSigner's key. There's a bit of subtlety here:
+// we shouldn't start exporting a key until it is properly persisted.
+// So, the protocol is:
+//   1) Generate a new TSK.
+//   2) Try to write it to the system table.
+//   3) Pass it back to the TokenSigner on success.
+//   4) Check and switch TokenSigner to the new key if it's time to do so.
+Status CatalogManager::CheckGenerateNewTskUnlocked() {
+  TokenSigner* signer = master_->token_signer();
+  unique_ptr<security::TokenSigningPrivateKey> tsk;
+  RETURN_NOT_OK(signer->CheckNeedKey(&tsk));
+  if (tsk) {
+    // First save the new TSK into the system table.
+    TokenSigningPrivateKeyPB tsk_pb;
+    tsk->ExportPB(&tsk_pb);
+    SysTskEntryPB sys_entry;
+    sys_entry.mutable_tsk()->Swap(&tsk_pb);
+    RETURN_NOT_OK(sys_catalog_->AddTskEntry(sys_entry));
+    LOG(INFO) << "Saved newly generated TSK " << tsk->key_seq_num()
+              << " into the system table.";
+    // Then add the new TSK into the signer.
+    RETURN_NOT_OK(signer->AddKey(std::move(tsk)));
+  }
+  return signer->TryRotateKey();
+}
+
+Status CatalogManager::LoadTskEntries(set<string>* expired_entry_ids) {
+  TskEntryLoader loader;
+  RETURN_NOT_OK(sys_catalog_->VisitTskEntries(&loader));
+  if (expired_entry_ids) {
+    set<string> ref(loader.expired_entry_ids());
+    expired_entry_ids->swap(ref);
+  }
+  return master_->token_signer()->ImportKeys(loader.entries());
+}
+
+Status CatalogManager::DeleteTskEntries(const set<string>& entry_ids) {
+  leader_lock_.AssertAcquiredForWriting();
+  return sys_catalog_->RemoveTskEntries(entry_ids);
 }
 
 struct DeferredAssignmentActions {
@@ -3772,8 +3978,8 @@ CatalogManager::ScopedLeaderSharedLock::ScopedLeaderSharedLock(
   }
 
   // Check if the catalog manager is the leader.
-  Consensus* consensus = catalog_->sys_catalog_->tablet_peer_->consensus();
-  ConsensusStatePB cstate = consensus->ConsensusState(CONSENSUS_CONFIG_COMMITTED);
+  ConsensusStatePB cstate = catalog_->sys_catalog_->tablet_peer()->consensus()->
+      ConsensusState(CONSENSUS_CONFIG_COMMITTED);
   string uuid = catalog_->master_->fs_manager()->uuid();
   if (PREDICT_FALSE(!cstate.has_leader_uuid() || cstate.leader_uuid() != uuid)) {
     leader_status_ = Status::IllegalState(

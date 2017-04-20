@@ -150,76 +150,39 @@ public class MiniKuduCluster implements AutoCloseable {
     // The following props are set via kudu-client's pom.
     String baseDirPath = TestUtils.getBaseDir();
 
-    long now = System.currentTimeMillis();
     LOG.info("Starting {} masters...", numMasters);
     int startPort = startMasters(PORT_START, numMasters, baseDirPath, bindHost);
 
     LOG.info("Starting {} tablet servers...", numTservers);
-    List<Integer> ports = TestUtils.findFreePorts(startPort, numTservers * 2);
-    for (int i = 0; i < numTservers; i++) {
-      int rpcPort = ports.get(i * 2);
-      tserverPorts.add(rpcPort);
-      String tsBaseDirPath = baseDirPath + "/ts-" + i + "-" + now;
-      new File(tsBaseDirPath).mkdir();
-      String logDirPath = tsBaseDirPath + "/logs";
-      new File(logDirPath).mkdir();
-      String dataDirPath = tsBaseDirPath + "/data";
-      String flagsPath = TestUtils.getFlagsPath();
-
-      List<String> commandLine = Lists.newArrayList(
-          TestUtils.findBinary("kudu-tserver"),
-          "--flagfile=" + flagsPath,
-          "--log_dir=" + logDirPath,
-          "--fs_wal_dir=" + dataDirPath,
-          "--fs_data_dirs=" + dataDirPath,
-          "--flush_threshold_mb=1",
-          "--tserver_master_addrs=" + masterAddresses,
-          "--webserver_interface=" + bindHost,
-          "--local_ip_for_outbound_sockets=" + bindHost,
-          "--webserver_port=" + (rpcPort + 1),
-          "--rpc_bind_addresses=" + bindHost + ":" + rpcPort);
-
-      if (miniKdc != null) {
-        commandLine.add("--keytab=" + keytab);
-        commandLine.add("--kerberos_principal=kudu/" + bindHost);
-        commandLine.add("--server_require_kerberos");
-      }
-
-      commandLine.addAll(extraTserverFlags);
-
-      tserverProcesses.put(rpcPort, configureAndStartProcess(rpcPort, commandLine));
-      commandLines.put(rpcPort, commandLine);
-
-      if (flagsPath.startsWith(baseDirPath)) {
-        // We made a temporary copy of the flags; delete them later.
-        pathsToDelete.add(flagsPath);
-      }
-      pathsToDelete.add(tsBaseDirPath);
-    }
+    startTabletServers(startPort, numTservers, baseDirPath);
   }
 
   /**
-   * Start the specified number of master servers with ports starting from a specified
+   * Start the specified number of masters with ports starting from the specified
    * number. Finds free web and RPC ports up front for all of the masters first, then
-   * starts them on those ports, populating 'masters' map.
-   * @param masterStartPort the starting point of the port range for the masters
-   * @param numMasters number of masters to start
+   * starts them on those ports.
+   *
+   * @param startPort the starting point of the port range for the masters
+   * @param numServers number of master servers to start
    * @param baseDirPath the base directory where the mini cluster stores its data
    * @return the next free port
    * @throws Exception if we are unable to start the masters
    */
-  private int startMasters(int masterStartPort,
-                           int numMasters,
+  private int startMasters(int startPort,
+                           int numServers,
                            String baseDirPath,
                            String bindHost) throws Exception {
+    if (numServers <= 0) {
+      return startPort;
+    }
     // Get the list of web and RPC ports to use for the master consensus configuration:
     // request NUM_MASTERS * 2 free ports as we want to also reserve the web
     // ports for the consensus configuration.
-    List<Integer> ports = TestUtils.findFreePorts(masterStartPort, numMasters * 2);
-    int lastFreePort = ports.get(ports.size() - 1);
-    List<Integer> masterRpcPorts = Lists.newArrayListWithCapacity(numMasters);
-    List<Integer> masterWebPorts = Lists.newArrayListWithCapacity(numMasters);
-    for (int i = 0; i < numMasters * 2; i++) {
+    final List<Integer> ports = TestUtils.findFreePorts(
+        startPort > 0 ? startPort : PORT_START, numServers * 2);
+    List<Integer> masterRpcPorts = Lists.newArrayListWithCapacity(numServers);
+    List<Integer> masterWebPorts = Lists.newArrayListWithCapacity(numServers);
+    for (int i = 0; i < numServers * 2; i++) {
       if (i % 2 == 0) {
         masterRpcPorts.add(ports.get(i));
         masterHostPorts.add(HostAndPort.fromParts(bindHost, ports.get(i)));
@@ -229,7 +192,7 @@ public class MiniKuduCluster implements AutoCloseable {
     }
     masterAddresses = NetUtil.hostsAndPortsToString(masterHostPorts);
     long now = System.currentTimeMillis();
-    for (int i = 0; i < numMasters; i++) {
+    for (int i = 0; i < numServers; i++) {
       int port = masterRpcPorts.get(i);
       String masterBaseDirPath = baseDirPath + "/master-" + i + "-" + now;
       new File(masterBaseDirPath).mkdir();
@@ -250,20 +213,24 @@ public class MiniKuduCluster implements AutoCloseable {
           "--log_dir=" + logDirPath,
           "--fs_wal_dir=" + dataDirPath,
           "--fs_data_dirs=" + dataDirPath,
+          "--ipki_ca_key_size=1024",
+          "--ipki_server_key_size=1024",
+          "--tsk_num_rsa_bits=512",
           "--webserver_interface=" + bindHost,
           "--local_ip_for_outbound_sockets=" + bindHost,
           "--rpc_bind_addresses=" + bindHost + ":" + port,
           "--webserver_port=" + masterWebPorts.get(i),
           "--raft_heartbeat_interval_ms=200"); // make leader elections faster for faster tests
 
-      if (numMasters > 1) {
+      if (numServers > 1) {
         commandLine.add("--master_addresses=" + masterAddresses);
       }
 
       if (miniKdc != null) {
-        commandLine.add("--keytab=" + keytab);
-        commandLine.add("--kerberos_principal=kudu/" + bindHost);
-        commandLine.add("--server_require_kerberos");
+        commandLine.add("--keytab_file=" + keytab);
+        commandLine.add("--principal=kudu/" + bindHost);
+        commandLine.add("--rpc_authentication=required");
+        commandLine.add("--superuser_acl=testuser");
       }
 
       commandLine.addAll(extraMasterFlags);
@@ -277,14 +244,81 @@ public class MiniKuduCluster implements AutoCloseable {
       }
       pathsToDelete.add(masterBaseDirPath);
     }
-    return lastFreePort + 1;
+    // Return next port number.
+    return ports.get(ports.size() - 1) + 1;
+  }
+
+  /**
+   * Start the specified number of tablet servers with ports starting from the specified
+   * number. Finds free web and RPC ports up front for all of the tablet servers first,
+   * then starts them on those ports.
+   *
+   * @param startPort the starting point of the port range for the masters
+   * @param numServers number of tablet servers to start
+   * @param baseDirPath the base directory where the mini cluster stores its data
+   * @return the next free port
+   * @throws Exception if something fails
+   */
+  private int startTabletServers(int startPort,
+                                 int numServers,
+                                 String baseDirPath) throws Exception {
+    if (numServers <= 0) {
+      return startPort;
+    }
+    long now = System.currentTimeMillis();
+    final List<Integer> ports = TestUtils.findFreePorts(
+        startPort > 0 ? startPort : PORT_START, numServers * 2);
+    for (int i = 0; i < numServers; i++) {
+      int rpcPort = ports.get(i * 2);
+      tserverPorts.add(rpcPort);
+      String tsBaseDirPath = baseDirPath + "/ts-" + i + "-" + now;
+      new File(tsBaseDirPath).mkdir();
+      String logDirPath = tsBaseDirPath + "/logs";
+      new File(logDirPath).mkdir();
+      String dataDirPath = tsBaseDirPath + "/data";
+      String flagsPath = TestUtils.getFlagsPath();
+
+      List<String> commandLine = Lists.newArrayList(
+          TestUtils.findBinary("kudu-tserver"),
+          "--flagfile=" + flagsPath,
+          "--log_dir=" + logDirPath,
+          "--fs_wal_dir=" + dataDirPath,
+          "--fs_data_dirs=" + dataDirPath,
+          "--flush_threshold_mb=1",
+          "--ipki_server_key_size=1024",
+          "--tserver_master_addrs=" + masterAddresses,
+          "--webserver_interface=" + bindHost,
+          "--local_ip_for_outbound_sockets=" + bindHost,
+          "--webserver_port=" + (rpcPort + 1),
+          "--rpc_bind_addresses=" + bindHost + ":" + rpcPort);
+
+      if (miniKdc != null) {
+        commandLine.add("--keytab_file=" + keytab);
+        commandLine.add("--principal=kudu/" + bindHost);
+        commandLine.add("--rpc_authentication=required");
+        commandLine.add("--superuser_acl=testuser");
+      }
+
+      commandLine.addAll(extraTserverFlags);
+
+      tserverProcesses.put(rpcPort, configureAndStartProcess(rpcPort, commandLine));
+      commandLines.put(rpcPort, commandLine);
+
+      if (flagsPath.startsWith(baseDirPath)) {
+        // We made a temporary copy of the flags; delete them later.
+        pathsToDelete.add(flagsPath);
+      }
+      pathsToDelete.add(tsBaseDirPath);
+    }
+    // Return next port number.
+    return ports.get(ports.size() - 1) + 1;
   }
 
   /**
    * Starts a process using the provided command and configures it to be daemon,
    * redirects the stderr to stdout, and starts a thread that will read from the process' input
    * stream and redirect that to LOG.
-   * @param port rpc port used to identify the process
+   * @param port RPC port used to identify the process
    * @param command process and options
    * @return The started process
    * @throws Exception Exception if an error prevents us from starting the process,
@@ -325,6 +359,18 @@ public class MiniKuduCluster implements AutoCloseable {
   public void restartDeadMasterOnPort(int port) throws Exception {
     restartDeadProcessOnPort(port, masterProcesses);
   }
+
+  /**
+   * Restart any master processes which are not currently running.
+   */
+  public void restartDeadMasters() throws Exception {
+    for (HostAndPort hostAndPort : masterHostPorts) {
+      if (!masterProcesses.containsKey(hostAndPort.getPort())) {
+        restartDeadProcessOnPort(hostAndPort.getPort(), masterProcesses);
+      }
+    }
+  }
+
 
   /**
    * Starts a previously killed tablet server process on the specified port.

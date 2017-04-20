@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <memory>
 #include <set>
 #include <string>
@@ -25,7 +26,6 @@
 #include <boost/optional.hpp>
 #include <sasl/sasl.h>
 
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/rpc/negotiation.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/sasl_common.h"
@@ -58,9 +58,10 @@ class ClientNegotiation {
   // 'release_socket'.
   //
   // The provided TlsContext must outlive this negotiation instance.
-  explicit ClientNegotiation(std::unique_ptr<Socket> socket,
-                             const security::TlsContext* tls_context,
-                             const boost::optional<security::SignedTokenPB>& authn_token);
+  ClientNegotiation(std::unique_ptr<Socket> socket,
+                    const security::TlsContext* tls_context,
+                    const boost::optional<security::SignedTokenPB>& authn_token,
+                    RpcEncryption encryption);
 
   // Enable PLAIN authentication.
   // Must be called before Negotiate().
@@ -172,12 +173,20 @@ class ClientNegotiation {
   Status AuthenticateByToken(faststring* recv_buf) WARN_UNUSED_RESULT;
 
   // Send an SASL_INITIATE message to the server.
+  // Returns:
+  //  Status::OK if the SASL_SUCCESS message is expected next.
+  //  Status::Incomplete if the SASL_CHALLENGE message is expected next.
+  //  Any other status indicates an error.
   Status SendSaslInitiate() WARN_UNUSED_RESULT;
 
   // Send a SASL_RESPONSE message to the server.
   Status SendSaslResponse(const char* resp_msg, unsigned resp_msg_len) WARN_UNUSED_RESULT;
 
   // Handle case when server sends SASL_CHALLENGE response.
+  // Returns:
+  //  Status::OK if a SASL_SUCCESS message is expected next.
+  //  Status::Incomplete if another SASL_CHALLENGE message is expected.
+  //  Any other status indicates an error.
   Status HandleSaslChallenge(const NegotiatePB& response) WARN_UNUSED_RESULT;
 
   // Handle case when server sends SASL_SUCCESS response.
@@ -191,9 +200,6 @@ class ClientNegotiation {
   // otherwise returns an appropriate error status.
   Status DoSaslStep(const std::string& in, const char** out, unsigned* out_len) WARN_UNUSED_RESULT;
 
-  // Decode the provided SASL-encoded data and append it to 'plaintext'.
-  Status SaslDecode(const std::string& encoded, std::string* plaintext) WARN_UNUSED_RESULT;
-
   Status SendConnectionContext() WARN_UNUSED_RESULT;
 
   // The socket to the remote server.
@@ -201,12 +207,14 @@ class ClientNegotiation {
 
   // SASL state.
   std::vector<sasl_callback_t> callbacks_;
-  gscoped_ptr<sasl_conn_t, SaslDeleter> sasl_conn_;
+  std::unique_ptr<sasl_conn_t, SaslDeleter> sasl_conn_;
   SaslHelper helper_;
+  boost::optional<std::string> nonce_;
 
   // TLS state.
   const security::TlsContext* tls_context_;
   security::TlsHandshake tls_handshake_;
+  const RpcEncryption encryption_;
   bool tls_negotiated_;
 
   // TSK state.
@@ -215,7 +223,7 @@ class ClientNegotiation {
   // Authentication state.
   std::string plain_auth_user_;
   std::string plain_pass_;
-  gscoped_ptr<sasl_secret_t, FreeDeleter> psecret_;
+  std::unique_ptr<sasl_secret_t, decltype(std::free)*> psecret_;
 
   // The set of features advertised by the client. Filled in when we send
   // the first message. This is not necessarily constant since some features

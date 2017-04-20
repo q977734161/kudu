@@ -44,7 +44,6 @@
 #include "kudu/util/env.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/locks.h"
-#include "kudu/util/logging.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/subprocess.h"
 #include "kudu/util/url-coding.h"
@@ -64,6 +63,11 @@ DEFINE_int32(webserver_max_post_length_bytes, 1024 * 1024,
              "the embedded web server.");
 TAG_FLAG(webserver_max_post_length_bytes, advanced);
 TAG_FLAG(webserver_max_post_length_bytes, runtime);
+
+DEFINE_string(webserver_x_frame_options, "DENY",
+              "The webserver will add an 'X-Frame-Options' HTTP header with this value "
+              "to all responses. This can help prevent clickjacking attacks.");
+TAG_FLAG(webserver_x_frame_options, advanced);
 
 namespace kudu {
 
@@ -189,7 +193,7 @@ Status Webserver::Start() {
       return Status::InvalidArgument(ss.str());
     }
     LOG(INFO) << "Webserver: Password file is " << opts_.password_file;
-    options.push_back("global_passwords_file");
+    options.push_back("global_auth_file");
     options.push_back(opts_.password_file);
   }
 
@@ -304,10 +308,6 @@ int Webserver::BeginRequestCallbackStatic(struct sq_connection* connection) {
 
 int Webserver::BeginRequestCallback(struct sq_connection* connection,
                                     struct sq_request_info* request_info) {
-  // Redaction is disabled from the web UI. This affects operations like default
-  // value and scan predicate pretty printing.
-  ScopedDisableRedaction disable_redaction;
-
   PathHandler* handler;
   {
     shared_lock<RWMutex> l(lock_);
@@ -390,19 +390,17 @@ int Webserver::RunPathHandler(const PathHandler& handler,
 
   string str = output.str();
   // Without styling, render the page as plain text
-  if (!use_style) {
-    sq_printf(connection, "HTTP/1.1 200 OK\r\n"
-              "Content-Type: text/plain\r\n"
-              "Content-Length: %zd\r\n"
-              "\r\n", str.length());
-  } else {
-    sq_printf(connection, "HTTP/1.1 200 OK\r\n"
-              "Content-Type: text/html\r\n"
-              "Content-Length: %zd\r\n"
-              "\r\n", str.length());
-  }
-
+  string headers = strings::Substitute(
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: $0\r\n"
+      "Content-Length: $1\r\n"
+      "X-Frame-Options: $2\r\n"
+      "\r\n",
+      use_style ? "text/html" : "text/plain",
+      str.length(),
+      FLAGS_webserver_x_frame_options);
   // Make sure to use sq_write for printing the body; sq_printf truncates at 8kb
+  sq_write(connection, headers.c_str(), headers.length());
   sq_write(connection, str.c_str(), str.length());
   return 1;
 }

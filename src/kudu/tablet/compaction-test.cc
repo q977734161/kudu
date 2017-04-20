@@ -237,7 +237,7 @@ class TestCompaction : public KuduRowSetTest {
     // Flush with a large roll threshold so we only write a single file.
     // This simplifies the test so we always need to reopen only a single rowset.
     RollingDiskRowSetWriter rsw(tablet()->metadata(), projection,
-                                BloomFilterSizing::BySizeAndFPRate(32*1024, 0.01f),
+                                Tablet::DefaultBloomSizing(),
                                 roll_threshold);
     ASSERT_OK(rsw.Open());
     ASSERT_OK(FlushCompactionInput(input, snap, HistoryGcOpts::Disabled(), &rsw));
@@ -413,7 +413,7 @@ class TestCompaction : public KuduRowSetTest {
       ASSERT_OK(BuildCompactionInput(merge_snap, rowsets, schema_, &compact_input));
       // Use a low target row size to increase the number of resulting rowsets.
       RollingDiskRowSetWriter rdrsw(tablet()->metadata(), schema_,
-                                    BloomFilterSizing::BySizeAndFPRate(32 * 1024, 0.01f),
+                                    Tablet::DefaultBloomSizing(),
                                     1024 * 1024); // 1 MB
       ASSERT_OK(rdrsw.Open());
       ASSERT_OK(FlushCompactionInput(compact_input.get(), merge_snap, HistoryGcOpts::Disabled(),
@@ -489,11 +489,11 @@ TEST_F(TestCompaction, TestFlushMRSWithRolling) {
 
   rows.clear();
   rowsets[1]->DebugDump(&rows);
-  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00154700", int32 val=15470, )"
-                "int32 nullable_val=15470); Undo Mutations: [@15471(DELETE)]; Redo Mutations: [];",
+  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00017150", int32 val=1715, )"
+            "int32 nullable_val=NULL); Undo Mutations: [@1716(DELETE)]; Redo Mutations: [];",
             rows[0]);
-  EXPECT_EQ(R"(RowIdxInBlock: 1; Base: (string key="hello 00154710", int32 val=15471, )"
-                "int32 nullable_val=NULL); Undo Mutations: [@15472(DELETE)]; Redo Mutations: [];",
+  EXPECT_EQ(R"(RowIdxInBlock: 1; Base: (string key="hello 00017160", int32 val=1716, )"
+            "int32 nullable_val=1716); Undo Mutations: [@1717(DELETE)]; Redo Mutations: [];",
             rows[1]);
 }
 
@@ -1077,11 +1077,18 @@ TEST_F(TestCompaction, TestEmptyFlushDoesntLeakBlocks) {
   fs::LogBlockManager* lbm = down_cast<fs::LogBlockManager*>(
       harness_->fs_manager()->block_manager());
 
-  int64_t before_count = lbm->CountBlocksForTests();
+  vector<BlockId> before_block_ids;
+  ASSERT_OK(lbm->GetAllBlockIds(&before_block_ids));
   ASSERT_OK(tablet()->Flush());
-  int64_t after_count = lbm->CountBlocksForTests();
+  vector<BlockId> after_block_ids;
+  ASSERT_OK(lbm->GetAllBlockIds(&after_block_ids));
 
-  ASSERT_EQ(after_count, before_count);
+  // Sort the two collections before the comparison as GetAllBlockIds() does
+  // not guarantee a deterministic order.
+  std::sort(before_block_ids.begin(), before_block_ids.end(), BlockIdCompare());
+  std::sort(after_block_ids.begin(), after_block_ids.end(), BlockIdCompare());
+
+  ASSERT_EQ(after_block_ids, before_block_ids);
 }
 
 } // namespace tablet

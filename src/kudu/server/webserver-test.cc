@@ -24,6 +24,7 @@
 #include "kudu/gutil/strings/util.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/security/test/test_certs.h"
+#include "kudu/security/test/test_pass.h"
 #include "kudu/server/default-path-handlers.h"
 #include "kudu/server/webserver.h"
 #include "kudu/util/curl_util.h"
@@ -50,6 +51,11 @@ void SetSslOptions(WebserverOptions* opts) {
                                         &password));
   opts->private_key_password_cmd = strings::Substitute("echo $0", password);
 }
+
+void SetHTPasswdOptions(WebserverOptions* opts) {
+  CHECK_OK(security::CreateTestHTPasswd(GetTestDataDirectory(),
+                                        &opts->password_file));
+}
 } // anonymous namespace
 
 class WebserverTest : public KuduTest {
@@ -66,6 +72,7 @@ class WebserverTest : public KuduTest {
     opts.port = 0;
     opts.doc_root = static_dir_;
     if (use_ssl()) SetSslOptions(&opts);
+    if (use_htpasswd()) SetHTPasswdOptions(&opts);
     server_.reset(new Webserver(opts));
 
     AddDefaultPathHandlers(server_.get());
@@ -80,6 +87,7 @@ class WebserverTest : public KuduTest {
  protected:
   // Overridden by subclasses.
   virtual bool use_ssl() const { return false; }
+  virtual bool use_htpasswd() const { return false; }
 
   EasyCurl curl_;
   faststring buf_;
@@ -94,9 +102,26 @@ class SslWebserverTest : public WebserverTest {
   bool use_ssl() const override { return true; }
 };
 
+class PasswdWebserverTest : public WebserverTest {
+ protected:
+  bool use_htpasswd() const override { return true; }
+};
+
+// Send a HTTP request with no username and password. It should reject
+// the request as the .htpasswd is presented to webserver.
+TEST_F(PasswdWebserverTest, TestPasswd) {
+  Status status = curl_.FetchURL(strings::Substitute("http://$0/", addr_.ToString()),
+                                 &buf_);
+  ASSERT_EQ("Remote error: HTTP 401", status.ToString());
+}
+
 TEST_F(WebserverTest, TestIndexPage) {
+  curl_.set_return_headers(true);
   ASSERT_OK(curl_.FetchURL(strings::Substitute("http://$0/", addr_.ToString()),
                            &buf_));
+  // Check expected header.
+  ASSERT_STR_CONTAINS(buf_.ToString(), "X-Frame-Options: DENY");
+
   // Should have expected title.
   ASSERT_STR_CONTAINS(buf_.ToString(), "Kudu");
 
@@ -131,7 +156,12 @@ TEST_F(WebserverTest, TestDefaultPaths) {
 }
 
 TEST_F(WebserverTest, TestRedactFlagsDump) {
-  // Test varz -- check for the sensitive flag is redacted.
+  // Test varz -- check for the sensitive flag is redacted and HTML-escaped.
+  ASSERT_OK(curl_.FetchURL(strings::Substitute("http://$0/varz", addr_.ToString()),
+                           &buf_));
+  ASSERT_STR_CONTAINS(buf_.ToString(), "--test_sensitive_flag=&lt;redacted&gt;");
+
+  // Test varz?raw -- check for the sensitive flag is redacted and not HTML-escaped.
   ASSERT_OK(curl_.FetchURL(strings::Substitute("http://$0/varz?raw=1", addr_.ToString()),
                            &buf_));
   ASSERT_STR_CONTAINS(buf_.ToString(), strings::Substitute("--test_sensitive_flag=$0",

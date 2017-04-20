@@ -368,9 +368,52 @@ class ClientTest : public KuduTest {
     }
   }
 
+  // Compares rows as obtained through a KuduScanBatch::RowPtr and through the
+  // the raw direct and indirect data blocks exposed by KuduScanBatch,
+  // asserting that they are the same.
+  void AssertRawDataMatches(const KuduSchema& projection_schema,
+                            const KuduScanBatch& batch,
+                            const KuduScanBatch::RowPtr& row,
+                            int row_idx,
+                            int num_projected_cols) {
+
+    const Schema& schema = *projection_schema.schema_;
+    size_t row_stride = ContiguousRowHelper::row_size(schema);
+    const uint8_t* row_data = batch.direct_data().data() + row_idx * row_stride;
+
+    int32_t raw_key_val = *reinterpret_cast<const int32_t*>(
+        ContiguousRowHelper::cell_ptr(schema, row_data, 0));
+    int key_val;
+    ASSERT_OK(row.GetInt32(0, &key_val));
+    EXPECT_EQ(key_val, raw_key_val);
+
+    // Test projections have either 1 or 4 columns.
+    if (num_projected_cols == 1) return;
+    ASSERT_EQ(4, num_projected_cols);
+
+    int32_t raw_int_col_val = *reinterpret_cast<const int32_t*>(
+        ContiguousRowHelper::cell_ptr(schema, row_data, 1));
+    int int_col_val;
+    ASSERT_OK(row.GetInt32(1, &int_col_val));
+    EXPECT_EQ(int_col_val, raw_int_col_val);
+
+    Slice raw_nullable_slice_col_val = *reinterpret_cast<const Slice*>(
+        DCHECK_NOTNULL(ContiguousRowHelper::nullable_cell_ptr(schema, row_data, 2)));
+    Slice nullable_slice_col_val;
+    ASSERT_OK(row.GetString(2, &nullable_slice_col_val));
+    EXPECT_EQ(nullable_slice_col_val, raw_nullable_slice_col_val);
+
+    int32_t raw_col_val = *reinterpret_cast<const int32_t*>(
+        ContiguousRowHelper::cell_ptr(schema, row_data, 3));
+    int col_val;
+    ASSERT_OK(row.GetInt32(3, &col_val));
+    EXPECT_EQ(col_val, raw_col_val);
+  }
+
   void DoTestScanWithoutPredicates() {
     KuduScanner scanner(client_table_.get());
     ASSERT_OK(scanner.SetProjectedColumns({ "key" }));
+
     LOG_TIMING(INFO, "Scanning with no predicates") {
       ASSERT_OK(scanner.Open());
 
@@ -379,10 +422,13 @@ class ClientTest : public KuduTest {
       uint64_t sum = 0;
       while (scanner.HasMoreRows()) {
         ASSERT_OK(scanner.NextBatch(&batch));
+        int count = 0;
         for (const KuduScanBatch::RowPtr& row : batch) {
           int32_t value;
           ASSERT_OK(row.GetInt32(0, &value));
           sum += value;
+          AssertRawDataMatches(
+              scanner.GetProjectionSchema(), batch, row, count++, 1 /* num projected cols */);
         }
       }
       // The sum should be the sum of the arithmetic series from
@@ -409,12 +455,15 @@ class ClientTest : public KuduTest {
       KuduScanBatch batch;
       while (scanner.HasMoreRows()) {
         ASSERT_OK(scanner.NextBatch(&batch));
+        int count = 0;
         for (const KuduScanBatch::RowPtr& row : batch) {
           Slice s;
           ASSERT_OK(row.GetString(2, &s));
           if (!s.starts_with("hello 2") && !s.starts_with("hello 3")) {
             FAIL() << row.ToString();
           }
+          AssertRawDataMatches(
+              scanner.GetProjectionSchema(), batch, row, count++, 4 /* num projected cols */);
         }
       }
     }
@@ -674,7 +723,7 @@ TEST_F(ClientTest, TestMasterDown) {
   shared_ptr<KuduTable> t;
   client_->data_->default_admin_operation_timeout_ = MonoDelta::FromSeconds(1);
   Status s = client_->OpenTable("other-tablet", &t);
-  ASSERT_TRUE(s.IsNetworkError());
+  ASSERT_TRUE(s.IsNetworkError()) << s.ToString();
 }
 
 TEST_F(ClientTest, TestScan) {
@@ -1079,6 +1128,25 @@ TEST_F(ClientTest, TestScanCloseProxy) {
     ASSERT_OK(scanner.Open());
     scanner.Close();
     CHECK_EQ(0, scanner.data_->proxy_.use_count()) << "Proxy was not reset!";
+  }
+}
+
+// Check that the client scanner does not redact rows.
+TEST_F(ClientTest, TestRowPtrNoRedaction) {
+  google::SetCommandLineOption("redact", "log");
+
+  NO_FATALS(InsertTestRows(client_table_.get(), FLAGS_test_scan_num_rows));
+  KuduScanner scanner(client_table_.get());
+  ASSERT_OK(scanner.SetProjectedColumns({ "key" }));
+  ASSERT_OK(scanner.Open());
+
+  ASSERT_TRUE(scanner.HasMoreRows());
+  KuduScanBatch batch;
+  while (scanner.HasMoreRows()) {
+    ASSERT_OK(scanner.NextBatch(&batch));
+    for (const KuduScanBatch::RowPtr& row : batch) {
+      ASSERT_NE("(int32 key=<redacted>)", row.ToString());
+    }
   }
 }
 
@@ -2183,7 +2251,10 @@ void ClientTest::DoTestWriteWithDeadServer(WhichServerToKill which) {
       break;
     case DEAD_TSERVER:
       ASSERT_TRUE(error->status().IsTimedOut());
-      ASSERT_STR_CONTAINS(error->status().ToString(), "Connection refused");
+      // TODO(KUDU-1466) Re-enable this assertion once the jira gets solved. We can't actually
+      // make an assertion on the reason for the timeout since sometimes tablet server connection
+      // errors get reported as GetTabletLocations timeouts.
+      // ASSERT_STR_CONTAINS(error->status().ToString(), "Connection refused");
       break;
   }
 
@@ -2485,48 +2556,66 @@ TEST_F(ClientTest, TestSessionMutationBufferMaxNum) {
   }
 }
 
+enum class RowSize {
+  CONSTANT,
+  RANDOM,
+};
+
+class FlushModeOpRatesTest : public ClientTest,
+                             public ::testing::WithParamInterface<RowSize> {
+};
+
 // A test scenario to compare rate of submission of small write operations
 // in AUTO_FLUSH and AUTO_FLUSH_BACKGROUND mode; all the operations have
 // the same pre-defined size.
-TEST_F(ClientTest, TestFlushModesCompareOpRatesFixedSize) {
-  const size_t kBufferSizeBytes = 1024;
-  const size_t kRowNum = 256;
-
-  vector<size_t> str_sizes(kRowNum, kBufferSizeBytes / 128);
-  CpuTimes t_afb;
-  TimeInsertOpBatch(KuduSession::AUTO_FLUSH_BACKGROUND,
-                    kBufferSizeBytes, 0, 2, str_sizes,
-                    &t_afb);
-  CpuTimes t_afs;
-  TimeInsertOpBatch(KuduSession::AUTO_FLUSH_SYNC,
-                    kBufferSizeBytes, 1, 2, str_sizes,
-                    &t_afs);
-  // AUTO_FLUSH_BACKGROUND should be faster than AUTO_FLUSH_SYNC.
-  EXPECT_GT(t_afs.wall, t_afb.wall);
-}
-
-// A test scenario to compare rate of submission of small write operations
-// in AUTO_FLUSH and AUTO_FLUSH_BACKGROUND mode with operations of random size.
-TEST_F(ClientTest, TestFlushModesCompareOpRatesRandomSize) {
-  const size_t kBufferSizeBytes = 1024;
-  const size_t kRowNum = 256;
-
-  SeedRandom();
-  vector<size_t> str_sizes(kRowNum);
-  for (size_t i = 0; i < kRowNum; ++i) {
-    str_sizes[i] = rand() % (kBufferSizeBytes / 128);
+TEST_P(FlushModeOpRatesTest, RunComparison) {
+  if (!AllowSlowTests()) {
+    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
+    return;
   }
-  CpuTimes t_afb;
-  TimeInsertOpBatch(KuduSession::AUTO_FLUSH_BACKGROUND,
-                    kBufferSizeBytes, 0, 2, str_sizes,
-                    &t_afb);
-  CpuTimes t_afs;
-  TimeInsertOpBatch(KuduSession::AUTO_FLUSH_SYNC,
-                    kBufferSizeBytes, 1, 2, str_sizes,
-                    &t_afs);
+
+  const size_t kBufferSizeBytes = 1024;
+  const size_t kRowNum = 256;
+
+  vector<size_t> str_sizes(kRowNum);
+  const RowSize mode = GetParam();
+  switch (mode) {
+    case RowSize::CONSTANT:
+      std::fill(str_sizes.begin(), str_sizes.end(), kBufferSizeBytes / 128);
+      break;
+
+    case RowSize::RANDOM:
+      SeedRandom();
+      std::generate(str_sizes.begin(), str_sizes.end(),
+                    [] { return rand() % (kBufferSizeBytes / 128); });
+      break;
+  }
+
+  // Run the scenario multiple times to factor out fluctuations of multi-tasking
+  // run-time environment and avoid test flakiness.
+  uint64_t t_afb_wall = 0;
+  uint64_t t_afs_wall = 0;
+  const size_t iter_num = 16;
+  for (size_t i = 0; i < iter_num; ++i) {
+    CpuTimes t_afb;
+    TimeInsertOpBatch(KuduSession::AUTO_FLUSH_BACKGROUND,
+                      kBufferSizeBytes, 2 * i, 2 * iter_num, str_sizes,
+                      &t_afb);
+    t_afb_wall += t_afb.wall;
+
+    CpuTimes t_afs;
+    TimeInsertOpBatch(KuduSession::AUTO_FLUSH_SYNC,
+                      kBufferSizeBytes, 2 * i + 1, 2 * iter_num, str_sizes,
+                      &t_afs);
+    t_afs_wall += t_afs.wall;
+  }
   // AUTO_FLUSH_BACKGROUND should be faster than AUTO_FLUSH_SYNC.
-  EXPECT_GT(t_afs.wall, t_afb.wall);
+  EXPECT_GT(t_afs_wall, t_afb_wall);
 }
+
+INSTANTIATE_TEST_CASE_P(,
+                        FlushModeOpRatesTest,
+                        ::testing::Values(RowSize::CONSTANT, RowSize::RANDOM));
 
 // A test to verify that it's safe to perform synchronous and/or asynchronous
 // flush while having the auto-flusher thread running in the background.
@@ -3145,15 +3234,6 @@ TEST_F(ClientTest, TestBasicAlterOperations) {
     ASSERT_STR_CONTAINS(s.ToString(), "cannot remove a key column");
   }
 
-  // test that renaming a key should throws an error
-  {
-    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
-    table_alterer->AlterColumn("key")->RenameTo("key2");
-    Status s = table_alterer->Alter();
-    ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(), "cannot rename a key column");
-  }
-
   // test that renaming to an already-existing name throws an error
   {
     gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
@@ -3221,6 +3301,7 @@ TEST_F(ClientTest, TestBasicAlterOperations) {
     ASSERT_EQ(1, tablet_peer->tablet()->metadata()->schema_version());
   }
 
+  // test that adds a new column of type string
   {
     gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     table_alterer->AddColumn("new_string_val")->Type(KuduColumnSchema::STRING)
@@ -3229,13 +3310,33 @@ TEST_F(ClientTest, TestBasicAlterOperations) {
     ASSERT_EQ(2, tablet_peer->tablet()->metadata()->schema_version());
   }
 
+  // test renaming primary key column
+  {
+    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("key")->RenameTo("key2");
+    Status s = table_alterer->Alter();
+    ASSERT_FALSE(s.IsInvalidArgument());
+    ASSERT_EQ(3, tablet_peer->tablet()->metadata()->schema_version());
+  }
+
+  // test that changing the data type of a primary key column throws an error
+  {
+    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("key2")->Type(KuduColumnSchema::INT64)->NotNull()->PrimaryKey();
+    Status s = table_alterer->Alter();
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
+    ASSERT_STR_CONTAINS(s.ToString(),
+                        "Not implemented: cannot alter attributes for column: key2");
+  }
+
+  // test that changes table name
   {
     const char *kRenamedTableName = "RenamedTable";
     gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     ASSERT_OK(table_alterer
               ->RenameTo(kRenamedTableName)
               ->Alter());
-    ASSERT_EQ(3, tablet_peer->tablet()->metadata()->schema_version());
+    ASSERT_EQ(4, tablet_peer->tablet()->metadata()->schema_version());
     ASSERT_EQ(kRenamedTableName, tablet_peer->tablet()->metadata()->table_name());
 
     CatalogManager *catalog_manager = cluster_->mini_master()->master()->catalog_manager();
@@ -3950,6 +4051,86 @@ TEST_F(ClientTest, TestInsertTooLongEncodedPrimaryKey) {
             errors[0]->status().ToString());
 }
 
+// Test trying to insert a row with an empty string PK.
+// Regression test for KUDU-1899.
+TEST_F(ClientTest, TestInsertEmptyPK) {
+  const string kLongValue(10000, 'x');
+  const char* kTableName = "empty-pk";
+
+  // Create and open a table with a three-column composite PK.
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  KuduSchema schema;
+  KuduSchemaBuilder schema_builder;
+  schema_builder.AddColumn("k1")->Type(KuduColumnSchema::STRING)->NotNull();
+  schema_builder.AddColumn("v1")->Type(KuduColumnSchema::STRING)->NotNull();
+  schema_builder.SetPrimaryKey({"k1"});
+  ASSERT_OK(schema_builder.Build(&schema));
+  ASSERT_OK(table_creator->table_name(kTableName)
+            .schema(&schema)
+            .num_replicas(1)
+            .set_range_partition_columns({ "k1" })
+            .Create());
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+
+  // Find the tablet.
+  scoped_refptr<TabletPeer> tablet_peer;
+  ASSERT_TRUE(cluster_->mini_tablet_server(0)->server()->tablet_manager()->LookupTablet(
+          GetFirstTabletId(table.get()), &tablet_peer));
+
+  // Utility function to get the current value of the row.
+  const auto ReadRowAsString = [&]() {
+    vector<string> rows;
+    ScanTableToStrings(table.get(), &rows);
+    if (rows.empty()) return string("<none>");
+    CHECK_EQ(1, rows.size());
+    return rows[0];
+  };
+
+  shared_ptr<KuduSession> session(client_->NewSession());
+  ASSERT_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
+
+  // Insert a row with empty primary key.
+  {
+    unique_ptr<KuduInsert> insert(table->NewInsert());
+    ASSERT_OK(insert->mutable_row()->SetString(0, ""));
+    ASSERT_OK(insert->mutable_row()->SetString(1, "initial"));
+    ASSERT_OK(session->Apply(insert.release()));
+    ASSERT_OK(session->Flush());
+  }
+  ASSERT_EQ("(string k1=\"\", string v1=\"initial\")", ReadRowAsString());
+
+  // Make sure that Flush works properly, and the data is still readable.
+  ASSERT_OK(tablet_peer->tablet()->Flush());
+  ASSERT_EQ("(string k1=\"\", string v1=\"initial\")", ReadRowAsString());
+
+  // Perform an update.
+  {
+    unique_ptr<KuduUpdate> update(table->NewUpdate());
+    ASSERT_OK(update->mutable_row()->SetString(0, ""));
+    ASSERT_OK(update->mutable_row()->SetString(1, "updated"));
+    ASSERT_OK(session->Apply(update.release()));
+    ASSERT_OK(session->Flush());
+  }
+  ASSERT_EQ("(string k1=\"\", string v1=\"updated\")", ReadRowAsString());
+  ASSERT_OK(tablet_peer->tablet()->FlushAllDMSForTests());
+  ASSERT_EQ("(string k1=\"\", string v1=\"updated\")", ReadRowAsString());
+  ASSERT_OK(tablet_peer->tablet()->Compact(tablet::Tablet::FORCE_COMPACT_ALL));
+  ASSERT_EQ("(string k1=\"\", string v1=\"updated\")", ReadRowAsString());
+
+  // Perform a delete.
+  {
+    unique_ptr<KuduDelete> del(table->NewDelete());
+    ASSERT_OK(del->mutable_row()->SetString(0, ""));
+    ASSERT_OK(session->Apply(del.release()));
+    ASSERT_OK(session->Flush());
+  }
+  ASSERT_EQ("<none>", ReadRowAsString());
+  ASSERT_OK(tablet_peer->tablet()->FlushAllDMSForTests());
+  ASSERT_EQ("<none>", ReadRowAsString());
+  ASSERT_OK(tablet_peer->tablet()->Compact(tablet::Tablet::FORCE_COMPACT_ALL));
+  ASSERT_EQ("<none>", ReadRowAsString());
+}
 
 // Check the behavior of the latest observed timestamp when performing
 // write and read operations.
@@ -4165,8 +4346,8 @@ TEST_P(IntEncodingNullPredicatesTest, TestIntEncodings) {
   // Insert rows.
   shared_ptr<KuduSession> session = table->client()->NewSession();
   ASSERT_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
-  session->SetTimeoutMillis(5000);
-  const size_t kNumRows = AllowSlowTests() ? 10000 : 10000;
+  session->SetTimeoutMillis(10000);
+  const size_t kNumRows = AllowSlowTests() ? 10000 : 1000;
   for (int i = 0; i < kNumRows; i++) {
     KuduInsert* insert = table->NewInsert();
     KuduPartialRow* row = insert->mutable_row();
@@ -4177,7 +4358,7 @@ TEST_P(IntEncodingNullPredicatesTest, TestIntEncodings) {
       ASSERT_OK(row->SetNull("int_val"));
     }
     ASSERT_OK(session->Apply(insert));
-    if (i % 10001 == 0) {
+    if (i + 1 % 1000 == 0) {
       ASSERT_OK(session->Flush());
     }
   }
@@ -4262,7 +4443,7 @@ TEST_P(BinaryEncodingNullPredicatesTest, TestBinaryEncodings) {
   // Insert rows.
   shared_ptr<KuduSession> session = table->client()->NewSession();
   ASSERT_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
-  session->SetTimeoutMillis(5000);
+  session->SetTimeoutMillis(10000);
   const size_t kNumRows = AllowSlowTests() ? 10000 : 1000;
   for (int i = 0; i < kNumRows; i++) {
     KuduInsert* insert = table->NewInsert();
@@ -4274,7 +4455,7 @@ TEST_P(BinaryEncodingNullPredicatesTest, TestBinaryEncodings) {
       ASSERT_OK(row->SetNull("string_val"));
     }
     ASSERT_OK(session->Apply(insert));
-    if (i % 10001 == 0) {
+    if (i + 1 % 1000 == 0) {
       ASSERT_OK(session->Flush());
     }
   }
@@ -4652,11 +4833,30 @@ TEST_F(ClientTest, TestConnectToClusterCompatibility) {
 }
 
 // Test that, when the client connects to a cluster, that it gets the relevant
-// certificate authority and authentication token from the master.
+// certificate authority and authentication token from the master. Also checks that
+// the data can be exported and re-imported into a new client.
 TEST_F(ClientTest, TestGetSecurityInfoFromMaster) {
   // Client is already connected when the test starts.
   ASSERT_TRUE(client_->data_->messenger_->authn_token() != boost::none);
   ASSERT_EQ(1, client_->data_->messenger_->tls_context().trusted_cert_count_for_tests());
+
+  string authn_creds;
+  ASSERT_OK(client_->ExportAuthenticationCredentials(&authn_creds));
+
+  // Creating a new client by importing the authentication data should result in the
+  // having the same token.
+  shared_ptr<KuduClient> new_client;
+  ASSERT_OK(KuduClientBuilder()
+            .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr().ToString())
+            .import_authentication_credentials(authn_creds)
+            .Build(&new_client));
+  ASSERT_EQ(client_->data_->messenger_->authn_token()->ShortDebugString(),
+            new_client->data_->messenger_->authn_token()->ShortDebugString());
+
+  // The new client should yield the same authentication data as the original.
+  string new_authn_creds;
+  ASSERT_OK(new_client->ExportAuthenticationCredentials(&new_authn_creds));
+  ASSERT_EQ(authn_creds, new_authn_creds);
 }
 
 struct ServiceUnavailableRetryParams {
@@ -4736,6 +4936,116 @@ static const ServiceUnavailableRetryParams service_unavailable_retry_cases[] = {
 INSTANTIATE_TEST_CASE_P(
     , ServiceUnavailableRetryClientTest,
     ::testing::ValuesIn(service_unavailable_retry_cases));
+
+TEST_F(ClientTest, TestPartitioner) {
+  // Create a table with the following 9 partitions:
+  //
+  //             hash bucket
+  //   key     0      1     2
+  //         -----------------
+  //  <3000    x      x     x
+  // 3000-7000 x      x     x
+  //  >=7000   x      x     x
+  int num_ranges = 3;
+  const int kNumHashPartitions = 3;
+  const char* kTableName = "TestPartitioner";
+
+  vector<unique_ptr<KuduPartialRow>> split_rows;
+  for (int32_t split : {3333, 6666}) {
+    unique_ptr<KuduPartialRow> row(schema_.NewRow());
+    ASSERT_OK(row->SetInt32("key", split));
+    split_rows.emplace_back(std::move(row));
+  }
+
+  shared_ptr<KuduTable> table;
+  gscoped_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  table_creator->table_name(kTableName)
+      .schema(&schema_)
+      .num_replicas(1)
+      .add_hash_partitions({ "key" }, kNumHashPartitions)
+      .set_range_partition_columns({ "key" });
+
+  for (const auto& row : split_rows) {
+    table_creator->add_range_partition_split(new KuduPartialRow(*row));
+  }
+  ASSERT_OK(table_creator->Create());
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+
+  // Build a partitioner on the table.
+  unique_ptr<KuduPartitioner> part;
+  {
+    KuduPartitioner* part_raw;
+    ASSERT_OK(KuduPartitionerBuilder(table)
+              .Build(&part_raw));
+    part.reset(part_raw);
+  }
+
+  ASSERT_EQ(num_ranges * kNumHashPartitions, part->NumPartitions());
+
+  // Partition a bunch of rows, counting how many fall into each partition.
+  unique_ptr<KuduPartialRow> row(table->schema().NewRow());
+  vector<int> counts_by_partition(part->NumPartitions());
+  const int kNumRowsToPartition = 10000;
+  for (int i = 0; i < kNumRowsToPartition; i++) {
+    ASSERT_OK(row->SetInt32(0, i));
+    int part_index;
+    ASSERT_OK(part->PartitionRow(*row, &part_index));
+    counts_by_partition.at(part_index)++;
+  }
+
+  // We don't expect a completely even division of rows into partitions, but
+  // we should be within 10% of that.
+  int expected_per_partition = kNumRowsToPartition / part->NumPartitions();
+  int fuzziness = expected_per_partition / 10;
+  for (int i = 0; i < part->NumPartitions(); i++) {
+    ASSERT_NEAR(counts_by_partition[i], expected_per_partition, fuzziness);
+  }
+
+  // Drop the first and third range partition.
+  unique_ptr<KuduTableAlterer> alterer(client_->NewTableAlterer(kTableName));
+  alterer->DropRangePartition(schema_.NewRow(), new KuduPartialRow(*split_rows[0]));
+  alterer->DropRangePartition(new KuduPartialRow(*split_rows[1]), schema_.NewRow());
+  ASSERT_OK(alterer->Alter());
+
+  // The existing partitioner should still return results based on the table
+  // state at the time it was created, and successfully return partitions
+  // for rows in the now-dropped range.
+  ASSERT_EQ(num_ranges * kNumHashPartitions, part->NumPartitions());
+  ASSERT_OK(row->SetInt32(0, 1000));
+  int part_index;
+  ASSERT_OK(part->PartitionRow(*row, &part_index));
+  ASSERT_GE(part_index, 0);
+
+  // If we recreate the partitioner, it should get the new partitioning info.
+  {
+    KuduPartitioner* part_raw;
+    ASSERT_OK(KuduPartitionerBuilder(table)
+              .Build(&part_raw));
+    part.reset(part_raw);
+  }
+  num_ranges = 1;
+  ASSERT_EQ(num_ranges * kNumHashPartitions, part->NumPartitions());
+
+  // ... and it should return -1 for non-covered ranges.
+  ASSERT_OK(row->SetInt32(0, 1000));
+  ASSERT_OK(part->PartitionRow(*row, &part_index));
+  ASSERT_EQ(-1, part_index);
+  ASSERT_OK(row->SetInt32(0, 8000));
+  ASSERT_OK(part->PartitionRow(*row, &part_index));
+  ASSERT_EQ(-1, part_index);
+}
+
+TEST_F(ClientTest, TestInvalidPartitionerBuilder) {
+  KuduPartitioner* part;
+  Status s = KuduPartitionerBuilder(client_table_)
+      .SetBuildTimeout(MonoDelta())
+      ->Build(&part);
+  ASSERT_EQ("Invalid argument: uninitialized timeout", s.ToString());
+
+  s = KuduPartitionerBuilder(sp::shared_ptr<KuduTable>())
+      .Build(&part);
+  ASSERT_EQ("Invalid argument: null table", s.ToString());
+}
 
 } // namespace client
 } // namespace kudu

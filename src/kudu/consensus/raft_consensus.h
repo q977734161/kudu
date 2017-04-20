@@ -125,6 +125,9 @@ class RaftConsensus : public Consensus,
                       const StatusCallback& client_cb,
                       boost::optional<tserver::TabletServerErrorPB::Code>* error_code) override;
 
+  Status UnsafeChangeConfig(const UnsafeChangeConfigRequestPB& req,
+                            tserver::TabletServerErrorPB::Code* error_code) override;
+
   Status GetLastOpId(OpIdType type, OpId* id) override;
 
   RaftPeerPB::Role role() const override;
@@ -175,6 +178,7 @@ class RaftConsensus : public Consensus,
  private:
   friend class ReplicaState;
   friend class RaftConsensusQuorumTest;
+  FRIEND_TEST(RaftConsensusQuorumTest, TestReplicasEnforceTheLogMatchingProperty);
 
   // Control whether printing of log messages should be done for a particular
   // function call.

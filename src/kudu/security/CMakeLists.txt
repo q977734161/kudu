@@ -58,9 +58,11 @@ set(SECURITY_SRCS
   ca/cert_management.cc
   cert.cc
   crypto.cc
+  kerberos_util.cc
   init.cc
   openssl_util.cc
   ${PORTED_X509_CHECK_HOST_CC}
+  simple_acl.cc
   tls_context.cc
   tls_handshake.cc
   tls_socket.cc
@@ -91,7 +93,7 @@ if (NOT NO_TESTS)
   set(SECURITY_TEST_SRCS
     security-test-util.cc
     test/mini_kdc.cc
-    test/test_certs.cc)
+    test/test_certs.cc test/test_pass.cc)
 
   add_library(security-test ${SECURITY_TEST_SRCS})
   target_link_libraries(security-test

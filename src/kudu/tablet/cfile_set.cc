@@ -28,7 +28,6 @@
 #include "kudu/common/column_materialization_context.h"
 #include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/map-util.h"
-#include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/diskrowset.h"
 #include "kudu/tablet/cfile_set.h"
@@ -45,6 +44,7 @@ using cfile::ReaderOptions;
 using cfile::DefaultColumnValueIterator;
 using fs::ReadableBlock;
 using std::shared_ptr;
+using std::unique_ptr;
 using strings::Substitute;
 
 ////////////////////////////////////////////////////////////
@@ -54,8 +54,8 @@ using strings::Substitute;
 static Status OpenReader(FsManager* fs,
                          shared_ptr<MemTracker> parent_mem_tracker,
                          const BlockId& block_id,
-                         gscoped_ptr<CFileReader> *new_reader) {
-  gscoped_ptr<ReadableBlock> block;
+                         unique_ptr<CFileReader>* new_reader) {
+  unique_ptr<ReadableBlock> block;
   RETURN_NOT_OK(fs->OpenBlock(block_id, &block));
 
   ReaderOptions opts;
@@ -99,15 +99,16 @@ Status CFileSet::DoOpen() {
     ColumnId col_id = e.first;
     DCHECK(!ContainsKey(readers_by_col_id_, col_id)) << "already open";
 
-    gscoped_ptr<CFileReader> reader;
+    unique_ptr<CFileReader> reader;
     RETURN_NOT_OK(OpenReader(rowset_metadata_->fs_manager(),
                              parent_mem_tracker_,
                              rowset_metadata_->column_data_block_for_col_id(col_id),
                              &reader));
-    readers_by_col_id_[col_id] = shared_ptr<CFileReader>(reader.release());
+    readers_by_col_id_[col_id] = std::move(reader);
     VLOG(1) << "Successfully opened cfile for column id " << col_id
             << " in " << rowset_metadata_->ToString();
   }
+  readers_by_col_id_.shrink_to_fit();
 
   if (rowset_metadata_->has_adhoc_index_block()) {
     RETURN_NOT_OK(OpenReader(rowset_metadata_->fs_manager(),
@@ -128,7 +129,7 @@ Status CFileSet::DoOpen() {
 
 Status CFileSet::OpenBloomReader() {
   FsManager* fs = rowset_metadata_->fs_manager();
-  gscoped_ptr<ReadableBlock> block;
+  unique_ptr<ReadableBlock> block;
   RETURN_NOT_OK(fs->OpenBlock(rowset_metadata_->bloom_block(), &block));
 
   ReaderOptions opts;
@@ -196,9 +197,8 @@ Status CFileSet::GetBounds(string* min_encoded_key,
 
 uint64_t CFileSet::EstimateOnDiskSize() const {
   uint64_t ret = 0;
-  for (const ReaderMap::value_type& e : readers_by_col_id_) {
-    const shared_ptr<CFileReader> &reader = e.second;
-    ret += reader->file_size();
+  for (const auto& e : readers_by_col_id_) {
+    ret += e.second->file_size();
   }
   return ret;
 }
@@ -263,13 +263,11 @@ Status CFileSet::NewKeyIterator(CFileIterator **key_iter) const {
 // Iterator
 ////////////////////////////////////////////////////////////
 CFileSet::Iterator::~Iterator() {
-  STLDeleteElements(&col_iters_);
 }
 
 Status CFileSet::Iterator::CreateColumnIterators(const ScanSpec* spec) {
   DCHECK_EQ(0, col_iters_.size());
-  vector<ColumnIterator*> ret_iters;
-  ElementDeleter del(&ret_iters);
+  vector<unique_ptr<ColumnIterator>> ret_iters;
   ret_iters.reserve(projection_->num_columns());
 
   CFileReader::CacheControl cache_blocks = CFileReader::CACHE_BLOCK;
@@ -291,15 +289,15 @@ Status CFileSet::Iterator::CreateColumnIterators(const ScanSpec* spec) {
         return Status::Corruption(Substitute("column $0 has no data in rowset $1",
                                              col_schema.ToString(), base_data_->ToString()));
       }
-      ret_iters.push_back(new DefaultColumnValueIterator(col_schema.type_info(),
-                                                         col_schema.read_default_value()));
+      ret_iters.emplace_back(new DefaultColumnValueIterator(col_schema.type_info(),
+                                                            col_schema.read_default_value()));
       continue;
     }
     CFileIterator *iter;
     RETURN_NOT_OK_PREPEND(base_data_->NewColumnIterator(col_id, cache_blocks, &iter),
                           Substitute("could not create iterator for column $0",
                                      projection_->column(proj_col_idx).ToString()));
-    ret_iters.push_back(iter);
+    ret_iters.emplace_back(iter);
   }
 
   col_iters_.swap(ret_iters);
@@ -415,7 +413,7 @@ Status CFileSet::Iterator::PrepareColumn(ColumnMaterializationContext *ctx) {
     return Status::OK();
   }
 
-  ColumnIterator* col_iter = col_iters_[ctx->col_idx()];
+  ColumnIterator* col_iter = col_iters_[ctx->col_idx()].get();
   size_t n = prepared_count_;
 
   if (!col_iter->seeked() || col_iter->GetCurrentOrdinal() != cur_idx_) {
@@ -456,7 +454,7 @@ Status CFileSet::Iterator::MaterializeColumn(ColumnMaterializationContext *ctx) 
   DCHECK_LT(ctx->col_idx(), col_iters_.size());
 
   RETURN_NOT_OK(PrepareColumn(ctx));
-  ColumnIterator* iter = col_iters_[ctx->col_idx()];
+  ColumnIterator* iter = col_iters_[ctx->col_idx()].get();
 
   RETURN_NOT_OK(iter->Scan(ctx));
 
@@ -486,7 +484,7 @@ Status CFileSet::Iterator::FinishBatch() {
 void CFileSet::Iterator::GetIteratorStats(vector<IteratorStats>* stats) const {
   stats->clear();
   stats->reserve(col_iters_.size());
-  for (const ColumnIterator* iter : col_iters_) {
+  for (const auto& iter : col_iters_) {
     ANNOTATE_IGNORE_READS_BEGIN();
     stats->push_back(iter->io_statistics());
     ANNOTATE_IGNORE_READS_END();

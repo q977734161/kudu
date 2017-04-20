@@ -1248,6 +1248,7 @@ LogBlockManager::LogBlockManager(Env* env, const BlockManagerOptions& opts)
     read_only_(opts.read_only),
     buggy_el6_kernel_(IsBuggyEl6Kernel(env->GetKernelRelease())),
     next_block_id_(1) {
+  blocks_by_block_id_.set_deleted_key(BlockId());
 
   int64_t file_cache_capacity = GetFileCacheCapacityForBlockManager(env_);
   if (file_cache_capacity != kint64max) {
@@ -1385,7 +1386,7 @@ Status LogBlockManager::Open() {
 }
 
 Status LogBlockManager::CreateBlock(const CreateBlockOptions& opts,
-                                    gscoped_ptr<WritableBlock>* block) {
+                                    unique_ptr<WritableBlock>* block) {
   CHECK(!read_only_);
 
   // Find a free container. If one cannot be found, create a new one.
@@ -1411,12 +1412,12 @@ Status LogBlockManager::CreateBlock(const CreateBlockOptions& opts,
   return Status::OK();
 }
 
-Status LogBlockManager::CreateBlock(gscoped_ptr<WritableBlock>* block) {
+Status LogBlockManager::CreateBlock(unique_ptr<WritableBlock>* block) {
   return CreateBlock(CreateBlockOptions(), block);
 }
 
 Status LogBlockManager::OpenBlock(const BlockId& block_id,
-                                  gscoped_ptr<ReadableBlock>* block) {
+                                  unique_ptr<ReadableBlock>* block) {
   scoped_refptr<LogBlock> lb;
   {
     std::lock_guard<simple_spinlock> l(lock_);
@@ -1481,9 +1482,11 @@ Status LogBlockManager::CloseBlocks(const std::vector<WritableBlock*>& blocks) {
   return Status::OK();
 }
 
-int64_t LogBlockManager::CountBlocksForTests() const {
+Status LogBlockManager::GetAllBlockIds(vector<BlockId>* block_ids) {
   std::lock_guard<simple_spinlock> l(lock_);
-  return blocks_by_block_id_.size();
+  block_ids->assign(open_block_ids_.begin(), open_block_ids_.end());
+  AppendKeysFromMap(blocks_by_block_id_, block_ids);
+  return Status::OK();
 }
 
 void LogBlockManager::AddNewContainerUnlocked(LogBlockContainer* container) {
@@ -1786,9 +1789,11 @@ bool LogBlockManager::IsBuggyEl6Kernel(const string& kernel_release) {
   if (kernel_release.find("el6") == string::npos) return false;
 
   // Kernels in the 6.8 update stream (2.6.32-642.a.b) are fixed
-  // for a >= 14.
+  // for a >= 15.
+  //
+  // https://rhn.redhat.com/errata/RHSA-2017-0307.html
   if (MatchPattern(kernel_release, "2.6.32-642.*.el6.*") &&
-      lt("2.6.32-642.14.0", kernel_release)) {
+      lt("2.6.32-642.15.0", kernel_release)) {
     return false;
   }
 

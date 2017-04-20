@@ -38,10 +38,9 @@ class Trace;
 namespace rpc {
 
 class InboundCall;
+class RemoteUser;
 class ResultTracker;
 class RpcSidecar;
-class UserCredentials;
-
 
 #define PANIC_RPC(rpc_context, message) \
   do { \
@@ -154,10 +153,22 @@ class RpcContext {
   // Upon success, writes the index of the sidecar (necessary to be retrieved
   // later) to 'idx'. Call may fail if all sidecars have already been used
   // by the RPC response.
-  Status AddRpcSidecar(gscoped_ptr<RpcSidecar> car, int* idx);
+  Status AddOutboundSidecar(std::unique_ptr<RpcSidecar> car, int* idx);
 
-  // Return the credentials of the remote user who made this call.
-  const UserCredentials& user_credentials() const;
+  // Fills 'sidecar' with a sidecar sent by the client. Returns an error if 'idx' is out
+  // of bounds.
+  Status GetInboundSidecar(int idx, Slice* slice);
+
+  // Return the identity of remote user who made this call.
+  const RemoteUser& remote_user() const;
+
+  // Discards the memory associated with the inbound call's payload. All previously
+  // obtained sidecar slices will be invalidated by this call. It is an error to call
+  // GetInboundSidecar() after this method. request_pb() remains valid.
+  // This is useful in the case where the server wishes to delay responding to an RPC
+  // (perhaps to control the rate of RPC requests), but knows that the RPC payload itself
+  // won't be processed any further.
+  void DiscardTransfer();
 
   // Return the remote IP address and port which sent the current RPC call.
   const Sockaddr& remote_address() const;
@@ -165,6 +176,12 @@ class RpcContext {
   // A string identifying the requestor -- both the user info and the IP address.
   // Suitable for use in log messages.
   std::string requestor_string() const;
+
+  // Return the name of the RPC service method being called.
+  std::string method_name() const;
+
+  // Return the name of the RPC service being called.
+  std::string service_name() const;
 
   const google::protobuf::Message *request_pb() const { return request_pb_.get(); }
   google::protobuf::Message *response_pb() const { return response_pb_.get(); }

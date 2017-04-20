@@ -17,11 +17,13 @@
 
 #include "kudu/rpc/rpc_context.h"
 
+#include <memory>
 #include <ostream>
 #include <sstream>
 
 #include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/inbound_call.h"
+#include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/result_tracker.h"
 #include "kudu/rpc/rpc_sidecar.h"
 #include "kudu/rpc/service_if.h"
@@ -31,6 +33,7 @@
 #include "kudu/util/trace.h"
 
 using google::protobuf::Message;
+using std::unique_ptr;
 
 namespace kudu {
 namespace rpc {
@@ -140,12 +143,20 @@ const rpc::RequestIdPB* RpcContext::request_id() const {
   return call_->header().has_request_id() ? &call_->header().request_id() : nullptr;
 }
 
-Status RpcContext::AddRpcSidecar(gscoped_ptr<RpcSidecar> car, int* idx) {
-  return call_->AddRpcSidecar(std::move(car), idx);
+Status RpcContext::AddOutboundSidecar(unique_ptr<RpcSidecar> car, int* idx) {
+  return call_->AddOutboundSidecar(std::move(car), idx);
 }
 
-const UserCredentials& RpcContext::user_credentials() const {
-  return call_->user_credentials();
+Status RpcContext::GetInboundSidecar(int idx, Slice* slice) {
+  return call_->GetInboundSidecar(idx, slice);
+}
+
+const RemoteUser& RpcContext::remote_user() const {
+  return call_->remote_user();
+}
+
+void RpcContext::DiscardTransfer() {
+  call_->DiscardTransfer();
 }
 
 const Sockaddr& RpcContext::remote_address() const {
@@ -153,8 +164,16 @@ const Sockaddr& RpcContext::remote_address() const {
 }
 
 std::string RpcContext::requestor_string() const {
-  return call_->user_credentials().ToString() + " at " +
+  return call_->remote_user().ToString() + " at " +
     call_->remote_address().ToString();
+}
+
+std::string RpcContext::method_name() const {
+  return call_->remote_method().method_name();
+}
+
+std::string RpcContext::service_name() const {
+  return call_->remote_method().service_name();
 }
 
 MonoTime RpcContext::GetClientDeadline() const {

@@ -118,11 +118,13 @@ public class CommandLineParser {
    * @return a kudu client
    */
   public KuduClient getClient() {
-    return new KuduClient.KuduClientBuilder(getMasterAddresses())
+    KuduClient c = new KuduClient.KuduClientBuilder(getMasterAddresses())
         .defaultOperationTimeoutMs(getOperationTimeoutMs())
         .defaultAdminOperationTimeoutMs(getAdminOperationTimeoutMs())
         .defaultSocketReadTimeoutMs(getSocketReadTimeoutMs())
         .build();
+    KuduTableMapReduceUtil.importCredentialsFromCurrentSubject(c);
+    return c;
   }
 
   /**

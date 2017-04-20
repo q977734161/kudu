@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executor;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.stumbleupon.async.Deferred;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,7 +42,8 @@ public class KuduClient implements AutoCloseable {
 
   public static final Logger LOG = LoggerFactory.getLogger(AsyncKuduClient.class);
 
-  private final AsyncKuduClient asyncClient;
+  @VisibleForTesting
+  final AsyncKuduClient asyncClient;
 
   KuduClient(AsyncKuduClient asyncClient) {
     this.asyncClient = asyncClient;
@@ -256,6 +258,33 @@ public class KuduClient implements AutoCloseable {
   }
 
   /**
+   * Export serialized authentication data that may be passed to a different
+   * client instance and imported to provide that client the ability to connect
+   * to the cluster.
+   */
+  @InterfaceStability.Unstable
+  public byte[] exportAuthenticationCredentials() throws KuduException {
+    return joinAndHandleException(asyncClient.exportAuthenticationCredentials());
+  }
+
+  /**
+   * Import data allowing this client to authenticate to the cluster.
+   * This will typically be used before making any connections to servers
+   * in the cluster.
+   *
+   * Note that, if this client has already been used by one user, this
+   * method cannot be used to switch authenticated users. Attempts to
+   * do so have undefined results, and may throw an exception.
+   *
+   * @param authnData then authentication data provided by a prior call to
+   * {@link #exportAuthenticationCredentials()}
+   */
+  @InterfaceStability.Unstable
+  public void importAuthenticationCredentials(byte[] authnData) {
+    asyncClient.importAuthenticationCredentials(authnData);
+  }
+
+  /**
    * Get the timeout used for operations on sessions and scanners.
    * @return a timeout in milliseconds
    */
@@ -269,6 +298,14 @@ public class KuduClient implements AutoCloseable {
    */
   public long getDefaultAdminOperationTimeoutMs() {
     return asyncClient.getDefaultAdminOperationTimeoutMs();
+  }
+
+  /**
+   * @return the list of master addresses, stringified using commas to separate
+   * them
+   */
+  public String getMasterAddressesAsString() {
+    return asyncClient.getMasterAddressesAsString();
   }
 
   // Helper method to handle joining and transforming the Exception we receive.

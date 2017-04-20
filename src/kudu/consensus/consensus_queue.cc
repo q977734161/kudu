@@ -83,6 +83,9 @@ METRIC_DEFINE_gauge_int64(tablet, in_progress_ops, "Operations in Progress",
                           MetricUnit::kOperations,
                           "Number of operations in the peer's queue ack'd by a minority of "
                           "peers.");
+METRIC_DEFINE_gauge_int64(tablet, ops_behind_leader, "Operations Behind Leader",
+                          MetricUnit::kOperations,
+                          "Number of operations this server believes it is behind the leader.");
 
 std::string PeerMessageQueue::TrackedPeer::ToString() const {
   return Substitute("Peer: $0, Is new: $1, Last received: $2, Next index: $3, "
@@ -98,7 +101,8 @@ std::string PeerMessageQueue::TrackedPeer::ToString() const {
   x.Instantiate(metric_entity, 0)
 PeerMessageQueue::Metrics::Metrics(const scoped_refptr<MetricEntity>& metric_entity)
   : num_majority_done_ops(INSTANTIATE_METRIC(METRIC_majority_done_ops)),
-    num_in_progress_ops(INSTANTIATE_METRIC(METRIC_in_progress_ops)) {
+    num_in_progress_ops(INSTANTIATE_METRIC(METRIC_in_progress_ops)),
+    num_ops_behind_leader(INSTANTIATE_METRIC(METRIC_ops_behind_leader)) {
 }
 #undef INSTANTIATE_METRIC
 
@@ -119,6 +123,7 @@ PeerMessageQueue::PeerMessageQueue(const scoped_refptr<MetricEntity>& metric_ent
   queue_state_.committed_index = 0;
   queue_state_.all_replicated_index = 0;
   queue_state_.majority_replicated_index = 0;
+  queue_state_.last_idx_appended_to_leader = 0;
   queue_state_.state = kQueueConstructed;
   queue_state_.mode = NON_LEADER;
   queue_state_.majority_size_ = -1;
@@ -173,6 +178,9 @@ void PeerMessageQueue::SetNonLeaderMode() {
   queue_state_.active_config.reset();
   queue_state_.mode = NON_LEADER;
   queue_state_.majority_size_ = -1;
+
+  // Update this when stepping down, since it doesn't get tracked as LEADER.
+  queue_state_.last_idx_appended_to_leader = queue_state_.last_appended.index();
   LOG_WITH_PREFIX_UNLOCKED(INFO) << "Queue going to NON_LEADER mode. State: "
       << queue_state_.ToString();
   time_manager_->SetNonLeaderMode();
@@ -339,17 +347,22 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
                                         ConsensusRequestPB* request,
                                         vector<ReplicateRefPtr>* msg_refs,
                                         bool* needs_tablet_copy) {
-  TrackedPeer* peer = nullptr;
+  // Maintain a thread-safe copy of necessary members.
   OpId preceding_id;
+  int num_voters;
+  int64_t current_term;
+  TrackedPeer peer;
+  MonoDelta unreachable_time;
   {
     std::lock_guard<simple_spinlock> lock(queue_lock_);
     DCHECK_EQ(queue_state_.state, kQueueOpen);
     DCHECK_NE(uuid, local_peer_pb_.permanent_uuid());
 
-    peer = FindPtrOrNull(peers_map_, uuid);
-    if (PREDICT_FALSE(peer == nullptr || queue_state_.mode == NON_LEADER)) {
+    TrackedPeer* peer_ptr = FindPtrOrNull(peers_map_, uuid);
+    if (PREDICT_FALSE(peer_ptr == nullptr || queue_state_.mode == NON_LEADER)) {
       return Status::NotFound("Peer not tracked or queue not in leader mode.");
     }
+    peer = *peer_ptr;
 
     // Clear the requests without deleting the entries, as they may be in use by other peers.
     request->mutable_ops()->ExtractSubrange(0, request->ops_size(), nullptr);
@@ -357,15 +370,17 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
     // This is initialized to the queue's last appended op but gets set to the id of the
     // log entry preceding the first one in 'messages' if messages are found for the peer.
     preceding_id = queue_state_.last_appended;
+    num_voters = CountVoters(*queue_state_.active_config);
+    current_term = queue_state_.current_term;
+
     request->set_committed_index(queue_state_.committed_index);
     request->set_all_replicated_index(queue_state_.all_replicated_index);
-    request->set_caller_term(queue_state_.current_term);
+    request->set_last_idx_appended_to_leader(queue_state_.last_appended.index());
+    request->set_caller_term(current_term);
+    unreachable_time = MonoTime::Now() - peer.last_successful_communication_time;
   }
-
-  MonoDelta unreachable_time =
-      MonoTime::Now() - peer->last_successful_communication_time;
   if (unreachable_time.ToSeconds() > FLAGS_follower_unavailable_considered_failed_sec) {
-    if (CountVoters(*queue_state_.active_config) > 2) {
+    if (num_voters > 2) {
       // We never drop from 2 to 1 automatically, at least for now. We may want
       // to revisit this later, we're just being cautious with this.
       string msg = Substitute("Leader has been unable to successfully communicate "
@@ -373,12 +388,11 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
                               uuid,
                               FLAGS_follower_unavailable_considered_failed_sec,
                               unreachable_time.ToString());
-      NotifyObserversOfFailedFollower(uuid, queue_state_.current_term, msg);
+      NotifyObserversOfFailedFollower(uuid, current_term, msg);
     }
   }
-
-  if (PREDICT_FALSE(peer->needs_tablet_copy)) {
-    KLOG_EVERY_N_SECS_THROTTLER(INFO, 3, peer->status_log_throttler, "tablet copy")
+  if (PREDICT_FALSE(peer.needs_tablet_copy)) {
+    KLOG_EVERY_N_SECS_THROTTLER(INFO, 3, peer.status_log_throttler, "tablet copy")
         << LogPrefixUnlocked() << "Peer " << uuid << " needs tablet copy" << THROTTLE_MSG;
     *needs_tablet_copy = true;
     return Status::OK();
@@ -388,14 +402,14 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
   // If we've never communicated with the peer, we don't know what messages to
   // send, so we'll send a status-only request. Otherwise, we grab requests
   // from the log starting at the last_received point.
-  if (!peer->is_new) {
+  if (!peer.is_new) {
 
     // The batch of messages to send to the peer.
     vector<ReplicateRefPtr> messages;
     int max_batch_size = FLAGS_consensus_max_batch_size_bytes - request->ByteSize();
 
     // We try to get the follower's next_index from our log.
-    Status s = log_cache_.ReadOps(peer->next_index - 1,
+    Status s = log_cache_.ReadOps(peer.next_index - 1,
                                   max_batch_size,
                                   &messages,
                                   &preceding_id);
@@ -406,7 +420,7 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
         string msg = Substitute("The logs necessary to catch up peer $0 have been "
                                 "garbage collected. The follower will never be able "
                                 "to catch up ($1)", uuid, s.ToString());
-        NotifyObserversOfFailedFollower(uuid, queue_state_.current_term, msg);
+        NotifyObserversOfFailedFollower(uuid, current_term, msg);
         return s;
       // IsIncomplete() means that we tried to read beyond the head of the log
       // (in the future). See KUDU-1078.
@@ -415,12 +429,12 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
         LOG_WITH_PREFIX_UNLOCKED(ERROR) << "Error trying to read ahead of the log "
                                         << "while preparing peer request: "
                                         << s.ToString() << ". Destination peer: "
-                                        << peer->ToString();
+                                        << peer.ToString();
         return s;
       }
       LOG_WITH_PREFIX_UNLOCKED(FATAL) << "Error reading the log while preparing peer request: "
                                       << s.ToString() << ". Destination peer: "
-                                      << peer->ToString();
+                                      << peer.ToString();
     }
 
     // We use AddAllocated rather than copy, because we pin the log cache at the
@@ -443,7 +457,7 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
   if (request->ops_size() > 0) {
     int64_t last_op_sent = request->ops(request->ops_size() - 1).id().index();
     if (last_op_sent < request->committed_index()) {
-      KLOG_EVERY_N_SECS_THROTTLER(INFO, 3, peer->status_log_throttler, "lagging")
+      KLOG_EVERY_N_SECS_THROTTLER(INFO, 3, peer.status_log_throttler, "lagging")
           << LogPrefixUnlocked() << "Peer " << uuid << " is lagging by at least "
           << (request->committed_index() - last_op_sent)
           << " ops behind the committed index " << THROTTLE_MSG;
@@ -477,26 +491,27 @@ Status PeerMessageQueue::RequestForPeer(const string& uuid,
 Status PeerMessageQueue::GetTabletCopyRequestForPeer(const string& uuid,
                                                           StartTabletCopyRequestPB* req) {
   TrackedPeer* peer = nullptr;
+  int64_t current_term;
   {
     std::lock_guard<simple_spinlock> lock(queue_lock_);
     DCHECK_EQ(queue_state_.state, kQueueOpen);
     DCHECK_NE(uuid, local_peer_pb_.permanent_uuid());
     peer = FindPtrOrNull(peers_map_, uuid);
+    current_term = queue_state_.current_term;
     if (PREDICT_FALSE(peer == nullptr || queue_state_.mode == NON_LEADER)) {
       return Status::NotFound("Peer not tracked or queue not in leader mode.");
     }
-  }
-
-  if (PREDICT_FALSE(!peer->needs_tablet_copy)) {
-    return Status::IllegalState("Peer does not need to initiate Tablet Copy", uuid);
+    if (PREDICT_FALSE(!peer->needs_tablet_copy)) {
+      return Status::IllegalState("Peer does not need to initiate Tablet Copy", uuid);
+    }
+    peer->needs_tablet_copy = false;
   }
   req->Clear();
   req->set_dest_uuid(uuid);
   req->set_tablet_id(tablet_id_);
   req->set_copy_peer_uuid(local_peer_pb_.permanent_uuid());
   *req->mutable_copy_peer_addr() = local_peer_pb_.last_known_addr();
-  req->set_caller_term(queue_state_.current_term);
-  peer->needs_tablet_copy = false; // Now reset the flag.
+  req->set_caller_term(current_term);
   return Status::OK();
 }
 
@@ -550,6 +565,8 @@ void PeerMessageQueue::AdvanceQueueWatermark(const char* type,
 
   // If we haven't enough peers to calculate the watermark return.
   if (watermarks.size() < num_peers_required) {
+    VLOG_WITH_PREFIX_UNLOCKED(3) << "Watermarks size: " << watermarks.size() << ", "
+                                 << "Num peers required: " << num_peers_required;
     return;
   }
 
@@ -580,6 +597,17 @@ void PeerMessageQueue::UpdateFollowerWatermarks(int64_t committed_index,
   queue_state_.committed_index = committed_index;
   queue_state_.all_replicated_index = all_replicated_index;
   UpdateMetrics();
+}
+
+void PeerMessageQueue::UpdateLagMetrics() {
+  metrics_.num_ops_behind_leader->set_value(queue_state_.mode == LEADER ? 0 :
+      queue_state_.last_idx_appended_to_leader - queue_state_.last_appended.index());
+}
+
+void PeerMessageQueue::UpdateLastIndexAppendedToLeader(int64_t last_idx_appended_to_leader) {
+  DCHECK_EQ(queue_state_.mode, NON_LEADER);
+  queue_state_.last_idx_appended_to_leader = last_idx_appended_to_leader;
+  UpdateLagMetrics();
 }
 
 void PeerMessageQueue::NotifyPeerIsResponsiveDespiteError(const std::string& peer_uuid) {
@@ -773,7 +801,12 @@ void PeerMessageQueue::ResponseFromPeer(const std::string& peer_uuid,
       } else {
         VLOG_WITH_PREFIX_UNLOCKED(2) << "Cannot advance commit index, waiting for > "
                                      << "first index in current leader term: "
-                                     << queue_state_.first_index_in_current_term;
+                                     << queue_state_.first_index_in_current_term << ". "
+                                     << "current majority_replicated_index: "
+                                     << queue_state_.majority_replicated_index << ", "
+                                     << "current committed_index: "
+                                     << queue_state_.committed_index;
+
       }
 
       // Only notify observers if the commit index actually changed.
@@ -839,6 +872,8 @@ void PeerMessageQueue::UpdateMetrics() {
     : 0);
   metrics_.num_in_progress_ops->set_value(
     queue_state_.last_appended.index() - queue_state_.committed_index);
+
+  UpdateLagMetrics();
 }
 
 void PeerMessageQueue::DumpToStrings(vector<string>* lines) const {
@@ -1011,10 +1046,10 @@ string PeerMessageQueue::LogPrefixUnlocked() const {
 
 string PeerMessageQueue::QueueState::ToString() const {
   return Substitute("All replicated index: $0, Majority replicated index: $1, "
-      "Committed index: $2, Last appended: $3, Current term: $4, Majority size: $5, "
-      "State: $6, Mode: $7$8",
+      "Committed index: $2, Last appended: $3, Last appended by leader: $4, Current term: $5, "
+      "Majority size: $6, State: $7, Mode: $8$9",
       all_replicated_index, majority_replicated_index,
-      committed_index, OpIdToString(last_appended), current_term,
+      committed_index, OpIdToString(last_appended), last_idx_appended_to_leader, current_term,
       majority_size_, state, (mode == LEADER ? "LEADER" : "NON_LEADER"),
       active_config ? ", active raft config: " + SecureShortDebugString(*active_config) : "");
 }

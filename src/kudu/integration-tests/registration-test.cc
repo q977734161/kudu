@@ -33,6 +33,7 @@
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/security/test/test_certs.h"
 #include "kudu/security/tls_context.h"
+#include "kudu/security/token_verifier.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/util/curl_util.h"
@@ -97,21 +98,27 @@ class RegistrationTest : public KuduTest {
     }
   }
 
-
-  Status WaitForReplicaCount(const string& tablet_id, int expected_count,
+  Status WaitForReplicaCount(const string& tablet_id,
+                             int expected_count,
                              TabletLocationsPB* locations) {
     while (true) {
-      master::CatalogManager* catalog = cluster_->mini_master()->master()->catalog_manager();
+      master::CatalogManager* catalog =
+          cluster_->mini_master()->master()->catalog_manager();
       Status s;
-      {
+      do {
         master::CatalogManager::ScopedLeaderSharedLock l(catalog);
-        RETURN_NOT_OK(l.first_failed_status());
+        const Status& ls = l.first_failed_status();
+        if (ls.IsServiceUnavailable()) {
+          // ServiceUnavailable means catalog manager is not yet ready
+          // to serve requests -- try again later.
+          break;  // exiting out of the 'do {...} while (false)' scope
+        }
+        RETURN_NOT_OK(ls);
         s = catalog->GetTabletLocations(tablet_id, locations);
-      }
+      } while (false);
       if (s.ok() && locations->replicas_size() == expected_count) {
         return Status::OK();
       }
-
       SleepFor(MonoDelta::FromMilliseconds(1));
     }
   }
@@ -213,6 +220,15 @@ TEST_F(RegistrationTest, TestTSGetsSignedX509Certificate) {
   AssertEventually([&](){
       ASSERT_TRUE(ts->server()->tls_context().has_signed_cert());
     }, MonoDelta::FromSeconds(10));
+}
+
+// Check that after the tablet server registers, it gets the list of valid
+// public token signing keys.
+TEST_F(RegistrationTest, TestTSGetsTskList) {
+  MiniTabletServer* ts = cluster_->mini_tablet_server(0);
+  AssertEventually([&](){
+      ASSERT_FALSE(ts->server()->token_verifier().ExportKeys().empty());
+    });
 }
 
 // Test that, if the tserver has HTTPS enabled, the master links to it

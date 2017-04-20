@@ -50,10 +50,6 @@
 #include "kudu/util/test_util.h"
 #include "kudu/util/trace.h"
 
-DECLARE_string(rpc_ssl_server_certificate);
-DECLARE_string(rpc_ssl_private_key);
-DECLARE_string(rpc_ssl_certificate_authority);
-
 namespace kudu { namespace rpc {
 
 using kudu::rpc_test::AddRequestPB;
@@ -69,6 +65,8 @@ using kudu::rpc_test::ExactlyOnceResponsePB;
 using kudu::rpc_test::FeatureFlags;
 using kudu::rpc_test::PanicRequestPB;
 using kudu::rpc_test::PanicResponsePB;
+using kudu::rpc_test::PushTwoStringsRequestPB;
+using kudu::rpc_test::PushTwoStringsResponsePB;
 using kudu::rpc_test::SendTwoStringsRequestPB;
 using kudu::rpc_test::SendTwoStringsResponsePB;
 using kudu::rpc_test::SleepRequestPB;
@@ -87,6 +85,7 @@ class GenericCalculatorService : public ServiceIf {
   static const char *kFullServiceName;
   static const char *kAddMethodName;
   static const char *kSleepMethodName;
+  static const char *kPushTwoStringsMethodName;
   static const char *kSendTwoStringsMethodName;
   static const char *kAddExactlyOnce;
 
@@ -109,6 +108,8 @@ class GenericCalculatorService : public ServiceIf {
       DoSleep(incoming);
     } else if (incoming->remote_method().method_name() == kSendTwoStringsMethodName) {
       DoSendTwoStrings(incoming);
+    } else if (incoming->remote_method().method_name() == kPushTwoStringsMethodName) {
+      DoPushTwoStrings(incoming);
     } else {
       incoming->RespondFailure(ErrorStatusPB::ERROR_NO_SUCH_METHOD,
                                Status::InvalidArgument("bad method"));
@@ -138,8 +139,8 @@ class GenericCalculatorService : public ServiceIf {
       LOG(FATAL) << "couldn't parse: " << param.ToDebugString();
     }
 
-    gscoped_ptr<faststring> first(new faststring);
-    gscoped_ptr<faststring> second(new faststring);
+    std::unique_ptr<faststring> first(new faststring);
+    std::unique_ptr<faststring> second(new faststring);
 
     Random r(req.random_seed());
     first->resize(req.size1());
@@ -150,13 +151,43 @@ class GenericCalculatorService : public ServiceIf {
 
     SendTwoStringsResponsePB resp;
     int idx1, idx2;
-    CHECK_OK(incoming->AddRpcSidecar(
-        make_gscoped_ptr(new RpcSidecar(std::move(first))), &idx1));
-    CHECK_OK(incoming->AddRpcSidecar(
-        make_gscoped_ptr(new RpcSidecar(std::move(second))), &idx2));
+    CHECK_OK(incoming->AddOutboundSidecar(
+            RpcSidecar::FromFaststring(std::move(first)), &idx1));
+    CHECK_OK(incoming->AddOutboundSidecar(
+            RpcSidecar::FromFaststring(std::move(second)), &idx2));
     resp.set_sidecar1(idx1);
     resp.set_sidecar2(idx2);
 
+    incoming->RespondSuccess(resp);
+  }
+
+  void DoPushTwoStrings(InboundCall* incoming) {
+    Slice param(incoming->serialized_request());
+    PushTwoStringsRequestPB req;
+    if (!req.ParseFromArray(param.data(), param.size())) {
+      LOG(FATAL) << "couldn't parse: " << param.ToDebugString();
+    }
+
+    Slice sidecar1;
+    CHECK_OK(incoming->GetInboundSidecar(req.sidecar1_idx(), &sidecar1));
+
+    Slice sidecar2;
+    CHECK_OK(incoming->GetInboundSidecar(req.sidecar2_idx(), &sidecar2));
+
+    // Check that reading non-existant sidecars doesn't work.
+    Slice tmp;
+    CHECK(!incoming->GetInboundSidecar(req.sidecar2_idx() + 2, &tmp).ok());
+
+    PushTwoStringsResponsePB resp;
+    resp.set_size1(sidecar1.size());
+    resp.set_data1(reinterpret_cast<const char*>(sidecar1.data()), sidecar1.size());
+    resp.set_size2(sidecar2.size());
+    resp.set_data2(reinterpret_cast<const char*>(sidecar2.data()), sidecar2.size());
+
+    // Drop the sidecars etc, just to confirm that it's safe to do so.
+    CHECK_GT(incoming->GetTransferSize(), 0);
+    incoming->DiscardTransfer();
+    CHECK_EQ(0, incoming->GetTransferSize());
     incoming->RespondSuccess(resp);
   }
 
@@ -231,8 +262,8 @@ class CalculatorService : public CalculatorServiceIf {
   void WhoAmI(const WhoAmIRequestPB* /*req*/,
               WhoAmIResponsePB* resp,
               RpcContext* context) override {
-    const UserCredentials& creds = context->user_credentials();
-    resp->mutable_credentials()->set_real_user(creds.real_user());
+    const RemoteUser& user = context->remote_user();
+    resp->mutable_credentials()->set_real_user(user.username());
     resp->set_address(context->remote_address().ToString());
     context->RespondSuccess();
   }
@@ -291,7 +322,7 @@ class CalculatorService : public CalculatorServiceIf {
   bool AuthorizeDisallowAlice(const google::protobuf::Message* /*req*/,
                               google::protobuf::Message* /*resp*/,
                               RpcContext* context) override {
-    if (context->user_credentials().real_user() == "alice") {
+    if (context->remote_user().username() == "alice") {
       context->RespondFailure(Status::NotAuthorized("alice is not allowed to call this method"));
       return false;
     }
@@ -301,7 +332,7 @@ class CalculatorService : public CalculatorServiceIf {
   bool AuthorizeDisallowBob(const google::protobuf::Message* /*req*/,
                             google::protobuf::Message* /*resp*/,
                             RpcContext* context) override {
-    if (context->user_credentials().real_user() == "bob") {
+    if (context->remote_user().username() == "bob") {
       context->RespondFailure(Status::NotAuthorized("bob is not allowed to call this method"));
       return false;
     }
@@ -330,6 +361,7 @@ class CalculatorService : public CalculatorServiceIf {
 const char *GenericCalculatorService::kFullServiceName = "kudu.rpc.GenericCalculatorService";
 const char *GenericCalculatorService::kAddMethodName = "Add";
 const char *GenericCalculatorService::kSleepMethodName = "Sleep";
+const char *GenericCalculatorService::kPushTwoStringsMethodName = "PushTwoStrings";
 const char *GenericCalculatorService::kSendTwoStringsMethodName = "SendTwoStrings";
 const char *GenericCalculatorService::kAddExactlyOnce = "AddExactlyOnce";
 
@@ -367,16 +399,12 @@ class RpcTestBase : public KuduTest {
   std::shared_ptr<Messenger> CreateMessenger(const string &name,
                                              int n_reactors = 1,
                                              bool enable_ssl = false) {
-    if (enable_ssl) {
-      std::string server_cert_path = GetTestPath("server-cert.pem");
-      std::string private_key_path = GetTestPath("server-key.pem");
-      CHECK_OK(security::CreateSSLServerCert(server_cert_path));
-      CHECK_OK(security::CreateSSLPrivateKey(private_key_path));
-      FLAGS_rpc_ssl_server_certificate = server_cert_path;
-      FLAGS_rpc_ssl_private_key = private_key_path;
-      FLAGS_rpc_ssl_certificate_authority = server_cert_path;
-    }
     MessengerBuilder bld(name);
+
+    if (enable_ssl) {
+      bld.enable_inbound_tls();
+    }
+
     bld.set_num_reactors(n_reactors);
     bld.set_connection_keepalive_time(
       MonoDelta::FromMilliseconds(keepalive_time_ms_));
@@ -420,7 +448,6 @@ class RpcTestBase : public KuduTest {
 
     Slice first = GetSidecarPointer(controller, resp.sidecar1(), size1);
     Slice second = GetSidecarPointer(controller, resp.sidecar2(), size2);
-
     Random rng(kSeed);
     faststring expected;
 
@@ -431,6 +458,30 @@ class RpcTestBase : public KuduTest {
     expected.resize(size2);
     RandomString(expected.data(), size2, &rng);
     CHECK_EQ(0, second.compare(Slice(expected)));
+  }
+
+  void DoTestOutgoingSidecar(const Proxy &p, int size1, int size2) {
+    PushTwoStringsRequestPB request;
+    RpcController controller;
+
+    int idx1;
+    string s1(size1, 'a');
+    CHECK_OK(controller.AddOutboundSidecar(RpcSidecar::FromSlice(Slice(s1)), &idx1));
+
+    int idx2;
+    string s2(size2, 'b');
+    CHECK_OK(controller.AddOutboundSidecar(RpcSidecar::FromSlice(Slice(s2)), &idx2));
+
+    request.set_sidecar1_idx(idx1);
+    request.set_sidecar2_idx(idx2);
+
+    PushTwoStringsResponsePB resp;
+    CHECK_OK(p.SyncRequest(GenericCalculatorService::kPushTwoStringsMethodName,
+            request, &resp, &controller));
+    CHECK_EQ(size1, resp.size1());
+    CHECK_EQ(resp.data1(), s1);
+    CHECK_EQ(size2, resp.size2());
+    CHECK_EQ(resp.data2(), s2);
   }
 
   void DoTestExpectTimeout(const Proxy &p, const MonoDelta &timeout) {
@@ -484,7 +535,7 @@ class RpcTestBase : public KuduTest {
   static Slice GetSidecarPointer(const RpcController& controller, int idx,
                                  int expected_size) {
     Slice sidecar;
-    CHECK_OK(controller.GetSidecar(idx, &sidecar));
+    CHECK_OK(controller.GetInboundSidecar(idx, &sidecar));
     CHECK_EQ(expected_size, sidecar.size());
     return Slice(sidecar.data(), expected_size);
   }

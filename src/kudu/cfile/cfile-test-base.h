@@ -44,6 +44,7 @@ DEFINE_int32(cfile_test_block_size, 1024,
 
 using kudu::fs::ReadableBlock;
 using kudu::fs::WritableBlock;
+using std::unique_ptr;
 
 namespace kudu {
 namespace cfile {
@@ -348,7 +349,7 @@ class CFileTestBase : public KuduTest {
                      int num_entries,
                      uint32_t flags,
                      BlockId* block_id) {
-    gscoped_ptr<WritableBlock> sink;
+    unique_ptr<WritableBlock> sink;
     ASSERT_OK(fs_manager_->CreateNewBlock(&sink));
     *block_id = sink->id();
     WriterOptions opts;
@@ -369,8 +370,10 @@ class CFileTestBase : public KuduTest {
 
     ASSERT_OK(w.Start());
 
-    // Append given number of values to the test tree
-    const size_t kBufferSize = 8192;
+    // Append given number of values to the test tree. We use 100 to match
+    // the output block size of compaction (kCompactionOutputBlockNumRows in
+    // compaction.cc, unfortunately not linkable from the cfile/ module)
+    const size_t kBufferSize = 100;
     size_t i = 0;
     while (i < num_entries) {
       int towrite = std::min(num_entries - i, kBufferSize);
@@ -460,9 +463,9 @@ void ReadBinaryFile(CFileIterator* iter, int* count) {
 void TimeReadFile(FsManager* fs_manager, const BlockId& block_id, size_t *count_ret) {
   Status s;
 
-  gscoped_ptr<fs::ReadableBlock> source;
+  unique_ptr<fs::ReadableBlock> source;
   ASSERT_OK(fs_manager->OpenBlock(block_id, &source));
-  gscoped_ptr<CFileReader> reader;
+  unique_ptr<CFileReader> reader;
   ASSERT_OK(CFileReader::Open(std::move(source), ReaderOptions(), &reader));
 
   gscoped_ptr<CFileIterator> iter;

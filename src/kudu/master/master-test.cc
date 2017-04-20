@@ -36,6 +36,8 @@
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/security/tls_context.h"
+#include "kudu/security/token_verifier.h"
 #include "kudu/server/rpc_server.h"
 #include "kudu/util/curl_util.h"
 #include "kudu/util/pb_util.h"
@@ -1324,12 +1326,23 @@ TEST_F(MasterTest, TestConnectToMaster) {
   ASSERT_EQ(1, resp.ca_cert_der_size()) << "should have one cert";
   EXPECT_GT(resp.ca_cert_der(0).size(), 100) << "CA cert should be at least 100 bytes";
   ASSERT_TRUE(resp.has_authn_token()) << "should return an authn token";
-  EXPECT_EQ(256, resp.authn_token().signature().size());
-  EXPECT_EQ(1, resp.authn_token().signing_key_seq_num());
+  // Using 512 bit RSA key and SHA256 digest results in 64 byte signature.
+  EXPECT_EQ(64, resp.authn_token().signature().size());
+  ASSERT_TRUE(resp.authn_token().has_signing_key_seq_num());
+  EXPECT_GT(resp.authn_token().signing_key_seq_num(), -1);
 
   security::TokenPB token;
   ASSERT_TRUE(token.ParseFromString(resp.authn_token().token_data()));
   ASSERT_TRUE(token.authn().has_username());
+}
+
+// Test that the master signs its on server certificate when it becomes the leader,
+// and also that it loads TSKs into the messenger's verifier.
+TEST_F(MasterTest, TestSignOwnCertAndLoadTSKs) {
+  AssertEventually([&]() {
+      ASSERT_TRUE(master_->tls_context().has_signed_cert());
+      ASSERT_GT(master_->messenger()->token_verifier().GetMaxKnownKeySequenceNumber(), -1);
+    });
 }
 
 } // namespace master

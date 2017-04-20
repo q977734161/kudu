@@ -18,16 +18,15 @@
 #include "kudu/master/master.h"
 
 #include <algorithm>
-#include <boost/bind.hpp>
-#include <glog/logging.h>
-#include <list>
 #include <memory>
 #include <vector>
+
+#include <boost/bind.hpp>
+#include <glog/logging.h>
 
 #include "kudu/cfile/block_cache.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/master/authn_token_manager.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master_cert_authority.h"
 #include "kudu/master/master_service.h"
@@ -37,6 +36,8 @@
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/service_if.h"
 #include "kudu/rpc/service_pool.h"
+#include "kudu/security/token_signer.h"
+#include "kudu/security/token_signing_key.h"
 #include "kudu/server/rpc_server.h"
 #include "kudu/tserver/tablet_copy_service.h"
 #include "kudu/tserver/tablet_service.h"
@@ -52,12 +53,27 @@ DEFINE_int32(master_registration_rpc_timeout_ms, 1500,
              "Timeout for retrieving master registration over RPC.");
 TAG_FLAG(master_registration_rpc_timeout_ms, experimental);
 
+DEFINE_int64(tsk_rotation_seconds, 60 * 60 * 24 * 1,
+             "Number of seconds between consecutive activations of newly "
+             "generated TSKs (Token Signing Keys).");
+TAG_FLAG(tsk_rotation_seconds, advanced);
+TAG_FLAG(tsk_rotation_seconds, experimental);
+
+DEFINE_int64(authn_token_validity_seconds, 60 * 60 * 24 * 7,
+             "Period of time for which an issued authentication token is valid. "
+             "It's not possible to renew a token, hence the token validity "
+             "interval defines the longest possible lifetime of an external "
+             "job which uses a token for authentication.");
+TAG_FLAG(authn_token_validity_seconds, experimental);
+
 using std::min;
 using std::shared_ptr;
 using std::vector;
 
 using kudu::consensus::RaftPeerPB;
 using kudu::rpc::ServiceIf;
+using kudu::security::TokenSigner;
+using kudu::security::TokenSigningPrivateKey;
 using kudu::tserver::ConsensusServiceImpl;
 using kudu::tserver::TabletCopyServiceImpl;
 using strings::Substitute;
@@ -96,19 +112,20 @@ Status Master::Init() {
 
   RETURN_NOT_OK(ServerBase::Init());
 
-  RETURN_NOT_OK(path_handlers_->Register(web_server_.get()));
+  if (web_server_) {
+    RETURN_NOT_OK(path_handlers_->Register(web_server_.get()));
+  }
 
   // The certificate authority object is initialized upon loading
   // CA private key and certificate from the system table when the server
   // becomes a leader.
   cert_authority_.reset(new MasterCertAuthority(fs_manager_->uuid()));
 
-  // TODO(PKI): this also will need to be wired together with CatalogManager
-  // soon, including initializing the token manager with the proper next
-  // sequence number.
-  authn_token_manager_.reset(new AuthnTokenManager());
-  RETURN_NOT_OK(authn_token_manager_->Init(1));
-
+  // The TokenSigner loads its keys during catalog manager initialization.
+  token_signer_.reset(new TokenSigner(
+      FLAGS_authn_token_validity_seconds,
+      FLAGS_tsk_rotation_seconds,
+      messenger_->shared_token_verifier()));
   state_ = kInitialized;
   return Status::OK();
 }
@@ -123,13 +140,13 @@ Status Master::Start() {
 Status Master::StartAsync() {
   CHECK_EQ(kInitialized, state_);
 
-  RETURN_NOT_OK(maintenance_manager_->Init());
+  RETURN_NOT_OK(maintenance_manager_->Init(fs_manager_->uuid()));
 
   gscoped_ptr<ServiceIf> impl(new MasterServiceImpl(this));
   gscoped_ptr<ServiceIf> consensus_service(new ConsensusServiceImpl(
-      metric_entity(), result_tracker(), catalog_manager_.get()));
+      this, catalog_manager_.get()));
   gscoped_ptr<ServiceIf> tablet_copy_service(new TabletCopyServiceImpl(
-      fs_manager_.get(), catalog_manager_.get(), metric_entity(), result_tracker()));
+      this, catalog_manager_.get()));
 
   RETURN_NOT_OK(ServerBase::RegisterService(std::move(impl)));
   RETURN_NOT_OK(ServerBase::RegisterService(std::move(consensus_service)));
@@ -218,12 +235,14 @@ Status Master::InitMasterRegistration() {
   RETURN_NOT_OK_PREPEND(rpc_server()->GetBoundAddresses(&rpc_addrs),
                         "Couldn't get RPC addresses");
   RETURN_NOT_OK(AddHostPortPBs(rpc_addrs, reg.mutable_rpc_addresses()));
-  vector<Sockaddr> http_addrs;
-  web_server()->GetBoundAddresses(&http_addrs);
-  RETURN_NOT_OK(AddHostPortPBs(http_addrs, reg.mutable_http_addresses()));
-  reg.set_software_version(VersionInfo::GetShortVersionString());
 
-  reg.set_https_enabled(web_server()->IsSecure());
+  if (web_server()) {
+    vector<Sockaddr> http_addrs;
+    web_server()->GetBoundAddresses(&http_addrs);
+    RETURN_NOT_OK(AddHostPortPBs(http_addrs, reg.mutable_http_addresses()));
+    reg.set_https_enabled(web_server()->IsSecure());
+  }
+  reg.set_software_version(VersionInfo::GetShortVersionString());
 
   registration_.Swap(&reg);
   registration_initialized_.store(true);

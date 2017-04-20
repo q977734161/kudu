@@ -53,6 +53,7 @@ DECLARE_bool(use_hybrid_clock);
 // the fuzz test.
 enum TestOpType {
   TEST_INSERT,
+  TEST_INSERT_PK_ONLY,
   TEST_UPSERT,
   TEST_UPSERT_PK_ONLY,
   TEST_UPDATE,
@@ -101,6 +102,7 @@ namespace tablet {
 
 const char* TestOpType_names[] = {
   "TEST_INSERT",
+  "TEST_INSERT_PK_ONLY",
   "TEST_UPSERT",
   "TEST_UPSERT_PK_ONLY",
   "TEST_UPDATE",
@@ -130,6 +132,33 @@ struct TestOp {
   }
 };
 
+const vector<TestOpType> kAllOps {TEST_INSERT,
+                                  TEST_INSERT_PK_ONLY,
+                                  TEST_UPSERT,
+                                  TEST_UPSERT_PK_ONLY,
+                                  TEST_UPDATE,
+                                  TEST_DELETE,
+                                  TEST_FLUSH_OPS,
+                                  TEST_FLUSH_TABLET,
+                                  TEST_FLUSH_DELTAS,
+                                  TEST_MINOR_COMPACT_DELTAS,
+                                  TEST_MAJOR_COMPACT_DELTAS,
+                                  TEST_COMPACT_TABLET,
+                                  TEST_RESTART_TS,
+                                  TEST_SCAN_AT_TIMESTAMP};
+
+const vector<TestOpType> kPkOnlyOps {TEST_INSERT_PK_ONLY,
+                                     TEST_UPSERT_PK_ONLY,
+                                     TEST_DELETE,
+                                     TEST_FLUSH_OPS,
+                                     TEST_FLUSH_TABLET,
+                                     TEST_FLUSH_DELTAS,
+                                     TEST_MINOR_COMPACT_DELTAS,
+                                     TEST_MAJOR_COMPACT_DELTAS,
+                                     TEST_COMPACT_TABLET,
+                                     TEST_RESTART_TS,
+                                     TEST_SCAN_AT_TIMESTAMP};
+
 // Test which does only random operations against a tablet, including update and random
 // get (ie scans with equal lower and upper bounds).
 //
@@ -142,11 +171,10 @@ class FuzzTest : public KuduTest {
     FLAGS_enable_maintenance_manager = false;
     FLAGS_use_hybrid_clock = false;
     FLAGS_scanner_allow_snapshot_scans_with_logical_timestamps = true;
-
-    schema_ = client::KuduSchemaFromSchema(CreateKeyValueTestSchema());
   }
 
-  void SetUp() override {
+  void CreateTabletAndStartClusterWithSchema(const Schema& schema) {
+    schema_ =  client::KuduSchemaFromSchema(schema);
     KuduTest::SetUp();
 
     MiniClusterOptions opts;
@@ -175,8 +203,8 @@ class FuzzTest : public KuduTest {
   }
 
   void TearDown() override {
-    tablet_peer_.reset();
-    cluster_->Shutdown();
+    if (tablet_peer_) tablet_peer_.reset();
+    if (cluster_) cluster_->Shutdown();
   }
 
   scoped_refptr<TabletPeer> LookupTabletPeer() {
@@ -211,7 +239,7 @@ class FuzzTest : public KuduTest {
                                         TestOpType type) {
     ExpectedKeyValueRow ret;
     unique_ptr<KuduWriteOperation> op;
-    if (type == TEST_INSERT) {
+    if (type == TEST_INSERT || type == TEST_INSERT_PK_ONLY) {
       op.reset(table_->NewInsert());
     } else {
       op.reset(table_->NewUpsert());
@@ -219,17 +247,26 @@ class FuzzTest : public KuduTest {
     KuduPartialRow* row = op->mutable_row();
     CHECK_OK(row->SetInt32(0, key));
     ret.key = key;
-    if (type != TEST_UPSERT_PK_ONLY) {
-      if (val & 1) {
-        CHECK_OK(row->SetNull(1));
-      } else {
-        CHECK_OK(row->SetInt32(1, val));
-        ret.val = val;
+    switch (type) {
+      case TEST_INSERT:
+      case TEST_UPSERT: {
+        if (val & 1) {
+          CHECK_OK(row->SetNull(1));
+        } else {
+          CHECK_OK(row->SetInt32(1, val));
+          ret.val = val;
+        }
+        break;
       }
-    } else {
-      // For "upsert PK only", we expect the row to keep its old value
-      // the row existed, or NULL if there was no old row.
-      ret.val = old_row ? old_row->val : boost::none;
+      case TEST_INSERT_PK_ONLY:
+        break;
+      case TEST_UPSERT_PK_ONLY: {
+        // For "upsert PK only", we expect the row to keep its old value if
+        // the row existed, or NULL if there was no old row.
+        ret.val = old_row ? old_row->val : boost::none;
+        break;
+      }
+      default: LOG(FATAL) << "Invalid test op type: " << TestOpType_names[type];
     }
     CHECK_OK(session_->Apply(op.release()));
     return ret;
@@ -276,7 +313,7 @@ class FuzzTest : public KuduTest {
       for (KuduScanBatch::RowPtr row : batch) {
         ExpectedKeyValueRow ret;
         CHECK_OK(row.GetInt32(0, &ret.key));
-        if (!row.IsNull(1)) {
+        if (schema_.num_columns() > 1 && !row.IsNull(1)) {
           ret.val = 0;
           CHECK_OK(row.GetInt32(1, ret.val.get_ptr()));
         }
@@ -356,7 +393,7 @@ class FuzzTest : public KuduTest {
       for (KuduScanBatch::RowPtr row : batch) {
         ExpectedKeyValueRow ret;
         ASSERT_OK(row.GetInt32(0, &ret.key));
-        if (!row.IsNull(1)) {
+        if (schema_.num_columns() > 1 && !row.IsNull(1)) {
           ret.val = 0;
           ASSERT_OK(row.GetInt32(1, ret.val.get_ptr()));
         }
@@ -377,6 +414,13 @@ class FuzzTest : public KuduTest {
   }
 
  protected:
+  // Validate that the given sequence is valid and would not cause any
+  // errors assuming that there are no bugs. For example, checks to make sure there
+  // aren't duplicate inserts with no intervening deletions.
+  //
+  // Useful when using the 'delta' test case reduction tool to allow
+  // it to skip invalid test cases.
+  void ValidateFuzzCase(const vector<TestOp>& test_ops);
   void RunFuzzCase(const vector<TestOp>& test_ops,
                    int update_multiplier);
 
@@ -393,9 +437,39 @@ class FuzzTest : public KuduTest {
   scoped_refptr<TabletPeer> tablet_peer_;
 };
 
+// The set of ops to draw from.
+enum TestOpSets {
+  ALL, // Pick an operation at random from all possible operations.
+  PK_ONLY // Pick an operation at random from the set of operations that apply only to the
+          // primary key (or that are now row-specific, like flushes or compactions).
+};
+
+TestOpType PickOpAtRandom(TestOpSets sets) {
+  switch (sets) {
+    case ALL:
+      return kAllOps[rand() % kAllOps.size()];
+    case PK_ONLY:
+      return kPkOnlyOps[rand() % kPkOnlyOps.size()];
+  }
+}
+
+bool IsMutation(const TestOpType& op) {
+  switch (op) {
+    case TEST_INSERT:
+    case TEST_INSERT_PK_ONLY:
+    case TEST_UPSERT:
+    case TEST_UPSERT_PK_ONLY:
+    case TEST_UPDATE:
+    case TEST_DELETE:
+      return true;
+    default:
+      return false;
+  }
+}
+
 // Generate a random valid sequence of operations for use as a
 // fuzz test.
-void GenerateTestCase(vector<TestOp>* ops, int len) {
+void GenerateTestCase(vector<TestOp>* ops, int len, TestOpSets sets = ALL) {
   vector<bool> exists(FLAGS_keyspace_size);
   int op_timestamps = 0;
   bool ops_pending = false;
@@ -404,12 +478,20 @@ void GenerateTestCase(vector<TestOp>* ops, int len) {
   bool data_in_dms = false;
   ops->clear();
   while (ops->size() < len) {
-    TestOpType r = tight_enum_cast<TestOpType>(rand() % enum_limits<TestOpType>::max_enumerator);
+    TestOpType r = PickOpAtRandom(sets);
     int row_key = rand() % FLAGS_keyspace_size;
+
+    // When we perform a test mutation, we also call GetRow() which does a scan
+    // and thus increases the server's timestamp.
+    if (IsMutation(r)) {
+      op_timestamps++;
+    }
+
     switch (r) {
       case TEST_INSERT:
+      case TEST_INSERT_PK_ONLY:
         if (exists[row_key]) continue;
-        ops->push_back({TEST_INSERT, row_key});
+        ops->push_back({r, row_key});
         exists[row_key] = true;
         ops_pending = true;
         data_in_mrs = true;
@@ -502,7 +584,7 @@ void GenerateTestCase(vector<TestOp>* ops, int len) {
         break;
       }
       default:
-        LOG(FATAL);
+        LOG(FATAL) << "Invalid op type: " << r;
     }
   }
 }
@@ -515,46 +597,53 @@ string DumpTestCase(const vector<TestOp>& ops) {
   return JoinStrings(strs, ",\n");
 }
 
+void FuzzTest::ValidateFuzzCase(const vector<TestOp>& test_ops) {
+  vector<bool> exists(FLAGS_keyspace_size);
+  for (const auto& test_op : test_ops) {
+    switch (test_op.type) {
+      case TEST_INSERT:
+      case TEST_INSERT_PK_ONLY:
+        CHECK(!exists[test_op.val]) << "invalid case: inserting already-existing row";
+        exists[test_op.val] = true;
+        break;
+      case TEST_UPSERT:
+      case TEST_UPSERT_PK_ONLY:
+        exists[test_op.val] = true;
+        break;
+      case TEST_UPDATE:
+        CHECK(exists[test_op.val]) << "invalid case: updating non-existing row";
+        break;
+      case TEST_DELETE:
+        CHECK(exists[test_op.val]) << "invalid case: deleting non-existing row";
+        exists[test_op.val] = false;
+        break;
+      default:
+        break;
+    }
+  }
+}
+
 void FuzzTest::RunFuzzCase(const vector<TestOp>& test_ops,
                            int update_multiplier = 1) {
+  ValidateFuzzCase(test_ops);
   // Dump the test case, since we usually run a random one.
   // This dump format is easy for a developer to copy-paste back
   // into a test method in order to reproduce a failure.
   LOG(INFO) << "test case:\n" << DumpTestCase(test_ops);
-
-  // Keep the vector of timestamps we'll scan at so that we save the expected state at those times.
-  vector<int> timestamps_to_scan;
-  for (const TestOp& test_op : test_ops) {
-    if (test_op.type == TEST_SCAN_AT_TIMESTAMP) {
-      timestamps_to_scan.push_back(test_op.val);
-    }
-  }
-  // Sort the scan timestamps in reverse order so that we can keep popping from the back and remove
-  // duplicates.
-  sort(timestamps_to_scan.begin(), timestamps_to_scan.end(), std::greater<int>());
-  timestamps_to_scan.erase(unique(timestamps_to_scan.begin(),
-                                  timestamps_to_scan.end()),
-                           timestamps_to_scan.end() );
 
   vector<optional<ExpectedKeyValueRow>> cur_val(FLAGS_keyspace_size);
   vector<optional<ExpectedKeyValueRow>> pending_val(FLAGS_keyspace_size);
 
   int i = 0;
   for (const TestOp& test_op : test_ops) {
-    switch (test_op.type) {
-      case TEST_INSERT:
-      case TEST_UPSERT:
-      case TEST_UPSERT_PK_ONLY:
-      case TEST_UPDATE:
-      case TEST_DELETE:
-        EXPECT_EQ(cur_val[test_op.val], GetRow(test_op.val));
-        break;
-      default: break;
+    if (IsMutation(test_op.type)) {
+      EXPECT_EQ(cur_val[test_op.val], GetRow(test_op.val));
     }
 
     LOG(INFO) << test_op.ToString();
     switch (test_op.type) {
       case TEST_INSERT:
+      case TEST_INSERT_PK_ONLY:
       case TEST_UPSERT:
       case TEST_UPSERT_PK_ONLY: {
         pending_val[test_op.val] = InsertOrUpsertRow(
@@ -574,12 +663,7 @@ void FuzzTest::RunFuzzCase(const vector<TestOp>& test_ops,
         cur_val = pending_val;
         int current_time = down_cast<kudu::server::LogicalClock*>(
             tablet()->clock().get())->GetCurrentTime();
-        // Check if the next snapshot scan has a time that is higher than the current time.
-        // If it is, then store the state so that we can match it later to the scanned state.
-        if (!timestamps_to_scan.empty() && current_time >= timestamps_to_scan.back()) {
-          saved_values_[current_time] = cur_val;
-          timestamps_to_scan.pop_back();
-        }
+        saved_values_[current_time] = cur_val;
         break;
       }
       case TEST_FLUSH_TABLET:
@@ -612,7 +696,19 @@ void FuzzTest::RunFuzzCase(const vector<TestOp>& test_ops,
 // Generates a random test sequence and runs it.
 // The logs of this test are designed to easily be copy-pasted and create
 // more specific test cases like TestFuzz<N> below.
+TEST_F(FuzzTest, TestRandomFuzzPksOnly) {
+  CreateTabletAndStartClusterWithSchema(Schema({ColumnSchema("key", INT32)}, 1));
+  SeedRandom();
+  vector<TestOp> test_ops;
+  GenerateTestCase(&test_ops, AllowSlowTests() ? 1000 : 50, TestOpSets::PK_ONLY);
+  RunFuzzCase(test_ops);
+}
+
+// Generates a random test sequence and runs it.
+// The logs of this test are designed to easily be copy-pasted and create
+// more specific test cases like TestFuzz<N> below.
 TEST_F(FuzzTest, TestRandomFuzz) {
+  CreateTabletAndStartClusterWithSchema(CreateKeyValueTestSchema());
   SeedRandom();
   vector<TestOp> test_ops;
   GenerateTestCase(&test_ops, AllowSlowTests() ? 1000 : 50);
@@ -623,6 +719,7 @@ TEST_F(FuzzTest, TestRandomFuzz) {
 // This results in very large batches which are likely to span multiple delta blocks
 // when flushed.
 TEST_F(FuzzTest, TestRandomFuzzHugeBatches) {
+  CreateTabletAndStartClusterWithSchema(CreateKeyValueTestSchema());
   SeedRandom();
   vector<TestOp> test_ops;
   GenerateTestCase(&test_ops, AllowSlowTests() ? 500 : 50);
@@ -637,6 +734,7 @@ TEST_F(FuzzTest, TestRandomFuzzHugeBatches) {
 }
 
 TEST_F(FuzzTest, TestFuzz1) {
+  CreateTabletAndStartClusterWithSchema(CreateKeyValueTestSchema());
   vector<TestOp> test_ops = {
       // Get an inserted row in a DRS.
       {TEST_INSERT, 0},
@@ -662,6 +760,7 @@ TEST_F(FuzzTest, TestFuzz1) {
 
 // A particular test case which previously failed TestFuzz.
 TEST_F(FuzzTest, TestFuzz2) {
+  CreateTabletAndStartClusterWithSchema(CreateKeyValueTestSchema());
   vector<TestOp> test_ops = {
     {TEST_INSERT, 0},
     {TEST_DELETE, 0},
@@ -694,6 +793,7 @@ TEST_F(FuzzTest, TestFuzz2) {
 
 // A particular test case which previously failed TestFuzz.
 TEST_F(FuzzTest, TestFuzz3) {
+  CreateTabletAndStartClusterWithSchema(CreateKeyValueTestSchema());
   vector<TestOp> test_ops = {
     {TEST_INSERT, 0},
     {TEST_FLUSH_OPS, 0},
@@ -728,6 +828,7 @@ TEST_F(FuzzTest, TestFuzz3) {
 
 // A particular test case which previously failed TestFuzz.
 TEST_F(FuzzTest, TestFuzz4) {
+  CreateTabletAndStartClusterWithSchema(CreateKeyValueTestSchema());
   vector<TestOp> test_ops = {
     {TEST_INSERT, 0},
     {TEST_FLUSH_OPS, 0},
@@ -757,12 +858,25 @@ TEST_F(FuzzTest, TestFuzz4) {
   RunFuzzCase(test_ops);
 }
 
+
+TEST_F(FuzzTest, TestFuzz5) {
+  CreateTabletAndStartClusterWithSchema(CreateKeyValueTestSchema());
+  vector<TestOp> test_ops = {
+    {TEST_UPSERT_PK_ONLY, 1},
+    {TEST_FLUSH_OPS, 0},
+    {TEST_INSERT, 0},
+    {TEST_SCAN_AT_TIMESTAMP, 5},
+  };
+  RunFuzzCase(test_ops);
+}
+
 // Previously caused incorrect data being read after restart.
 // Failure:
 //  Value of: val_in_table
 //  Actual: "()"
 //  Expected: "(" + cur_val + ")"
 TEST_F(FuzzTest, TestFuzzWithRestarts1) {
+  CreateTabletAndStartClusterWithSchema(CreateKeyValueTestSchema());
   RunFuzzCase({
       {TEST_INSERT, 1},
       {TEST_FLUSH_OPS, 0},
@@ -789,6 +903,7 @@ TEST_F(FuzzTest, TestFuzzWithRestarts1) {
 // insert undo deltas in sorted order (ascending key, then descending ts):
 // got key (row 1@tx5965182714017464320) after (row 1@tx5965182713875046400)
 TEST_F(FuzzTest, TestFuzzWithRestarts2) {
+  CreateTabletAndStartClusterWithSchema(CreateKeyValueTestSchema());
   RunFuzzCase({
       {TEST_INSERT, 0},
       {TEST_FLUSH_OPS, 0},
@@ -823,6 +938,7 @@ TEST_F(FuzzTest, TestFuzzWithRestarts2) {
 // Regression test for KUDU-1467: a sequence involving
 // UPSERT which failed to replay properly upon bootstrap.
 TEST_F(FuzzTest, TestUpsertSeq) {
+  CreateTabletAndStartClusterWithSchema(CreateKeyValueTestSchema());
   RunFuzzCase({
       {TEST_INSERT, 1},
       {TEST_UPSERT, 1},
@@ -841,7 +957,8 @@ TEST_F(FuzzTest, TestUpsertSeq) {
 
 // Regression test for KUDU-1623: updates without primary key
 // columns specified can cause crashes and issues at restart.
-TEST_F(FuzzTest, TestUpsert_PKOnly) {
+TEST_F(FuzzTest, TestUpsert_PKOnlyOps) {
+  CreateTabletAndStartClusterWithSchema(CreateKeyValueTestSchema());
   RunFuzzCase({
       {TEST_INSERT, 1},
       {TEST_FLUSH_OPS, 0},
@@ -849,6 +966,20 @@ TEST_F(FuzzTest, TestUpsert_PKOnly) {
       {TEST_FLUSH_OPS, 0},
       {TEST_RESTART_TS, 0}
     });
+}
+
+// Regression test for KUDU-1905: reinserts to a tablet that has
+// only primary keys end up as empty change lists. We were previously
+// crashing when a changelist was empty.
+TEST_F(FuzzTest, TestUpsert_PKOnlySchema) {
+  CreateTabletAndStartClusterWithSchema(Schema({ColumnSchema("key", INT32)}, 1));
+  RunFuzzCase({
+      {TEST_UPSERT_PK_ONLY, 1},
+      {TEST_DELETE, 1},
+      {TEST_UPSERT_PK_ONLY, 1},
+      {TEST_UPSERT_PK_ONLY, 1},
+      {TEST_FLUSH_OPS, 0}
+     });
 }
 
 } // namespace tablet

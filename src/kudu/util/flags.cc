@@ -30,21 +30,26 @@
 #include <gperftools/heap-profiler.h>
 
 #include "kudu/gutil/strings/join.h"
+#include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/os-util.h"
 #include "kudu/util/path_util.h"
+#include "kudu/util/string_case.h"
 #include "kudu/util/url-coding.h"
 #include "kudu/util/version_info.h"
 
 using google::CommandLineFlagInfo;
+
 using std::cout;
 using std::endl;
 using std::string;
 using std::stringstream;
 using std::unordered_set;
+
+using strings::Substitute;
 
 // Because every binary initializes its flags here, we use it as a convenient place
 // to offer some global flags as well.
@@ -91,8 +96,8 @@ static bool ValidateUmask(const char* /*flagname*/, const string& value) {
   }
   return true;
 }
-static bool dummy = google::RegisterFlagValidator(&FLAGS_umask, &ValidateUmask);
 
+DEFINE_validator(umask, &ValidateUmask);
 
 DEFINE_bool(unlock_experimental_flags, false,
             "Unlock flags marked as 'experimental'. These flags are not guaranteed to "
@@ -108,12 +113,53 @@ DEFINE_bool(unlock_unsafe_flags, false,
 TAG_FLAG(unlock_unsafe_flags, advanced);
 TAG_FLAG(unlock_unsafe_flags, stable);
 
-DEFINE_bool(redact_sensitive_flags, true,
-            "Sensitive flags marked as 'sensitive'. The value of these flags will "
-            "be redacted when logging the configuration at daemon startup.");
-TAG_FLAG(redact_sensitive_flags, advanced);
-TAG_FLAG(redact_sensitive_flags, evolving);
+DEFINE_string(redact, "all",
+              "Comma-separated list of redactions. Supported options are 'flag', "
+              "'log', 'all', and 'none'. If 'flag' is specified, configuration flags which may "
+              "include sensitive data will be redacted whenever server configuration "
+              "is emitted. If 'log' is specified, row data will be redacted from log "
+              "and error messages. If 'all' is specified, all of above will be redacted. "
+              "If 'none' is specified, no redaction will occur.");
+TAG_FLAG(redact, advanced);
+TAG_FLAG(redact, evolving);
 
+static bool ValidateRedact(const char* /*flagname*/, const string& value) {
+  kudu::g_should_redact_log = false;
+  kudu::g_should_redact_flag = false;
+
+  // Flag value is case insensitive.
+  string redact_flags;
+  kudu::ToUpperCase(value, &redact_flags);
+
+  // 'all', 'none', and '' must be specified without any other option.
+  if (redact_flags == "ALL") {
+    kudu::g_should_redact_log = true;
+    kudu::g_should_redact_flag = true;
+    return true;
+  }
+  if (redact_flags == "NONE" || redact_flags.empty()) {
+    return true;
+  }
+
+  for (const auto& t : strings::Split(redact_flags, ",", strings::SkipEmpty())) {
+    if (t == "LOG") {
+      kudu::g_should_redact_log = true;
+    } else if (t == "FLAG") {
+      kudu::g_should_redact_flag = true;
+    } else if (t == "ALL" || t == "NONE") {
+      LOG(ERROR) << "Invalid redaction options: "
+                 << value << ", '" << t << "' must be specified by itself.";
+      return false;
+    } else {
+      LOG(ERROR) << "Invalid redaction type: " << t <<
+                    ". Available types are 'flag', 'log', 'all', and 'none'.";
+      return false;
+    }
+  }
+  return true;
+}
+
+DEFINE_validator(redact, &ValidateRedact);
 // Tag a bunch of the flags that we inherit from glog/gflags.
 
 //------------------------------------------------------------
@@ -359,19 +405,23 @@ void CheckFlagsAllowed() {
   }
 }
 
-// Redact the flag tagged as 'sensitive', if --redact_sensitive_flags
-// is true. Otherwise, return its value as-is.
-string CheckFlagAndRedact(const CommandLineFlagInfo& flag) {
-  string retval;
+// Redact the flag tagged as 'sensitive', if --redact is set
+// with 'flag'. Otherwise, return its value as-is. If EscapeMode
+// is set to HTML, return HTML escaped string.
+string CheckFlagAndRedact(const CommandLineFlagInfo& flag, EscapeMode mode) {
+  string ret_value;
   unordered_set<string> tags;
   GetFlagTags(flag.name, &tags);
 
-  if (ContainsKey(tags, "sensitive") && FLAGS_redact_sensitive_flags) {
-    retval += kRedactionMessage;
+  if (ContainsKey(tags, "sensitive") && g_should_redact_flag) {
+    ret_value = kRedactionMessage;
   } else {
-    retval += flag.current_value;
+    ret_value = flag.current_value;
   }
-  return retval;
+  if (mode == EscapeMode::HTML) {
+    ret_value = EscapeForHtmlToString(ret_value);
+  }
+  return ret_value;
 }
 
 void SetUmask() {
@@ -424,19 +474,23 @@ void HandleCommonFlags() {
 #endif
 }
 
-string CommandlineFlagsIntoString() {
-  string retval;
+string CommandlineFlagsIntoString(EscapeMode mode) {
+  string ret_value;
   vector<CommandLineFlagInfo> flags;
   GetAllFlags(&flags);
 
   for (const auto& f : flags) {
-    retval += "--";
-    retval += f.name;
-    retval += "=";
-    retval += CheckFlagAndRedact(f);
-    retval += "\n";
+    ret_value += "--";
+    if (mode == EscapeMode::HTML) {
+      ret_value += EscapeForHtmlToString(f.name);
+    } else if (mode == EscapeMode::NONE) {
+      ret_value += f.name;
+    }
+    ret_value += "=";
+    ret_value += CheckFlagAndRedact(f, mode);
+    ret_value += "\n";
   }
-  return retval;
+  return ret_value;
 }
 
 string GetNonDefaultFlags(const GFlagsMap& default_flags) {
@@ -457,10 +511,10 @@ string GetNonDefaultFlags(const GFlagsMap& default_flags) {
           args << '\n';
         }
 
-        // Redact the flags tagged as sensitive, if --redact_sensitive_flags
-        // is true.
-        string flagValue = CheckFlagAndRedact(flag);
-        args << "--" << flag.name << '=' << flagValue;
+        // Redact the flags tagged as sensitive, if --redact is set
+        // with 'flag'.
+        string flag_value = CheckFlagAndRedact(flag, EscapeMode::NONE);
+        args << "--" << flag.name << '=' << flag_value;
       }
     }
   }

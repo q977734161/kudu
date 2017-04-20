@@ -48,7 +48,7 @@ three tablet servers is necessary.
 .Operating System Requirements
 Linux::
     - RHEL 6, RHEL 7, CentOS 6, CentOS 7, Ubuntu 14.04 (Trusty), Ubuntu 16.04 (Xenial), Debian 8 (Jessie), or SLES 12.
-    - A kernel and fileystem that support _hole punching_. Hole punching is the use of the
+    - A kernel and filesystem that support _hole punching_. Hole punching is the use of the
       `fallocate(2)` system call with the `FALLOC_FL_PUNCH_HOLE` option set. See
       link:troubleshooting.html#req_hole_punching[troubleshooting hole punching] for more
       information.
@@ -576,6 +576,24 @@ the workspace, and then try to re-build.
 ----
 $ git clean -fdx
 $ thirdparty/build-if-necessary.sh
+----
+
+  - Some combinations of Homebrew installations and system upgrades can result with a
+different kind of error:
++
+----
+libtool: Version mismatch error.  This is libtool 2.4.6, but the
+libtool: definition of this LT_INIT comes from libtool 2.4.2.
+libtool: You should recreate aclocal.m4 with macros from libtool 2.4.6
+libtool: and run autoconf again.
+----
++
+As described in this link:https://github.com/Homebrew/legacy-homebrew/issues/43874[thread],
+a possible fix is to uninstall and reinstall libtool:
++
+[source,bash]
+----
+$ brew uninstall libtool && brew install libtool
 ----
 
 . Build Kudu. Choose a build directory for the intermediate output, which can be

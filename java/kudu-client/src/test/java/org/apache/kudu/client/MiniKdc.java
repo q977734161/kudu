@@ -229,7 +229,7 @@ public class MiniKdc implements Closeable {
   private void createKrb5Conf() throws IOException {
     List<String> contents = ImmutableList.of(
         "[logging]",
-        "   kdc = STDERR",
+        "   kdc = FILE:/dev/stderr",
 
         "[libdefaults]",
         "   default_realm = " + options.realm,
@@ -262,6 +262,7 @@ public class MiniKdc implements Closeable {
     List<String> contents = ImmutableList.of(
         "[kdcdefaults]",
         "   kdc_ports = " + options.port,
+        "   kdc_tcp_ports = \"\"",
 
         "[realms]",
         options.realm + " = {",

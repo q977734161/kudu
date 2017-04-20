@@ -340,7 +340,7 @@ message ConsensusRequestPB {
   // committed during the same request.
   repeated ReplicateMsg ops = 6;
 
-  // The lowest index that is known to be replicated by all members of
+  // The highest index that is known to be replicated by all members of
   // the configuration.
   //
   // NOTE: this is not necessarily monotonically increasing. For example, if a node is in
@@ -354,6 +354,10 @@ message ConsensusRequestPB {
   // the "safe time" past the timestamp of the last committed message and answer snapshot scans
   // in the present in the absense of writes.
   optional fixed64 safe_timestamp = 10;
+
+  // The index of the most recent operation appended to the leader.
+  // Followers can use this to determine roughly how far behind they are from the leader.
+  optional int64 last_idx_appended_to_leader = 11;
 }
 
 message ConsensusResponsePB {
@@ -482,8 +486,33 @@ message StartTabletCopyResponsePB {
   optional tserver.TabletServerErrorPB error = 1;
 }
 
+// An unsafe change configuration request for the tablet with 'tablet_id'.
+message UnsafeChangeConfigRequestPB {
+  // UUID of server this request is addressed to.
+  optional bytes dest_uuid = 1;
+  required bytes tablet_id = 2;
+
+  // Sender identification, it could be a static string as well.
+  required bytes caller_id = 3;
+
+  // The raft config sent to destination server.
+  // Only the 'permanent_uuid' of each peer in the config is
+  // required (address-related information is ignored by the server).
+  // The peers specified in the 'new_config' are required to be a
+  // subset of (or equal to) the peers in the committed config on the
+  // destination replica.
+  required RaftConfigPB new_config = 4;
+}
+
+// The unsafe change configuration response. 'error' field is set if operation failed.
+message UnsafeChangeConfigResponsePB {
+  optional tserver.TabletServerErrorPB error = 1;
+}
+
 // A Raft implementation.
 service ConsensusService {
+  option (kudu.rpc.default_authz_method) = "AuthorizeServiceUser";
+
   // Analogous to AppendEntries in Raft, but only used for followers.
   rpc UpdateConsensus(ConsensusRequestPB) returns (ConsensusResponsePB);
 
@@ -495,6 +524,9 @@ service ConsensusService {
   // an operation to change the role of a server between VOTER and NON_VOTER.
   // An OK response means the operation was successful.
   rpc ChangeConfig(ChangeConfigRequestPB) returns (ChangeConfigResponsePB);
+
+  // Implements unsafe config change operation for manual recovery use cases.
+  rpc UnsafeChangeConfig(UnsafeChangeConfigRequestPB) returns (UnsafeChangeConfigResponsePB);
 
   rpc GetNodeInstance(GetNodeInstanceRequestPB) returns (GetNodeInstanceResponsePB);
 

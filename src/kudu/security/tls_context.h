@@ -19,13 +19,15 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <boost/optional.hpp>
 
 #include "kudu/security/cert.h"
 #include "kudu/security/tls_handshake.h"
 #include "kudu/util/atomic.h"
-#include "kudu/util/mutex.h"
+#include "kudu/util/locks.h"
+#include "kudu/util/rw_mutex.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -69,12 +71,12 @@ class TlsContext {
 
   ~TlsContext() = default;
 
-  Status Init();
+  Status Init() WARN_UNUSED_RESULT;
 
   // Returns true if this TlsContext has been configured with a cert and key for
   // use with TLS-encrypted connections.
   bool has_cert() const {
-    MutexLock lock(lock_);
+    shared_lock<RWMutex> lock(lock_);
     return has_cert_;
   }
 
@@ -82,13 +84,13 @@ class TlsContext {
   // cert and key for use with TLS-encrypted connections. If this method returns
   // true, then 'has_trusted_cert' will also return true.
   bool has_signed_cert() const {
-    MutexLock lock(lock_);
+    shared_lock<RWMutex> lock(lock_);
     return has_cert_ && !csr_;
   }
 
   // Returns true if this TlsContext has at least one certificate in its trust store.
   bool has_trusted_cert() const {
-    MutexLock lock(lock_);
+    shared_lock<RWMutex> lock(lock_);
     return trusted_cert_count_ > 0;
   }
 
@@ -98,15 +100,18 @@ class TlsContext {
   // any CA certificates that are part of the certificate chain for the cert
   // passed in to 'UseCertificateAndKey()' or 'AdoptSignedCert()'.
   //
-  // Returns AlreadyPresent if the cert is already marked as trusted. Other
-  // OpenSSL errors will be RuntimeError.
-  Status AddTrustedCertificate(const Cert& cert);
+  // If this cert has already been marked as trusted, this has no effect.
+  Status AddTrustedCertificate(const Cert& cert) WARN_UNUSED_RESULT;
+
+  // Dump all of the certs that are currently trusted by this context, in DER
+  // form, into 'cert_ders'.
+  Status DumpTrustedCerts(std::vector<std::string>* cert_ders) const WARN_UNUSED_RESULT;
 
   // Uses 'cert' and 'key' as the cert and key for use with TLS connections.
   //
   // Checks that the CA that issued the signature on 'cert' is already trusted
   // by this context (e.g. by AddTrustedCertificate()).
-  Status UseCertificateAndKey(const Cert& cert, const PrivateKey& key);
+  Status UseCertificateAndKey(const Cert& cert, const PrivateKey& key) WARN_UNUSED_RESULT;
 
   // Generates a self-signed cert and key for use with TLS connections.
   //
@@ -115,7 +120,7 @@ class TlsContext {
   // CA-signed cert for the generated private key, and 'AdoptSignedCert' can be
   // used to transition to using the CA-signed cert with subsequent TLS
   // connections.
-  Status GenerateSelfSignedCertAndKey(const std::string& server_uuid);
+  Status GenerateSelfSignedCertAndKey() WARN_UNUSED_RESULT;
 
   // Returns a new certificate signing request (CSR) in DER format, if this
   // context's cert is self-signed. If the cert is already signed, returns
@@ -131,40 +136,45 @@ class TlsContext {
   // by this context (e.g. by AddTrustedCertificate()).
   //
   // This has no effect if the instance already has a CA-signed cert.
-  Status AdoptSignedCert(const Cert& cert);
+  Status AdoptSignedCert(const Cert& cert) WARN_UNUSED_RESULT;
 
   // Convenience functions for loading cert/CA/key from file paths.
   // -------------------------------------------------------------
 
   // Load the server certificate and key (PEM encoded).
   Status LoadCertificateAndKey(const std::string& certificate_path,
-                               const std::string& key_path);
+                               const std::string& key_path) WARN_UNUSED_RESULT;
 
   // Load the certificate authority (PEM encoded).
-  Status LoadCertificateAuthority(const std::string& certificate_path);
+  Status LoadCertificateAuthority(const std::string& certificate_path) WARN_UNUSED_RESULT;
 
   // Initiates a new TlsHandshake instance.
-  Status InitiateHandshake(TlsHandshakeType handshake_type, TlsHandshake* handshake) const;
+  Status InitiateHandshake(TlsHandshakeType handshake_type,
+                           TlsHandshake* handshake) const WARN_UNUSED_RESULT;
 
   // Return the number of certs that have been marked as trusted.
   // Used by tests.
   int trusted_cert_count_for_tests() const {
-    MutexLock lock(lock_);
+    shared_lock<RWMutex> lock(lock_);
     return trusted_cert_count_;
   }
 
+  bool is_external_cert() const { return is_external_cert_; }
+
  private:
 
-  Status VerifyCertChain(const Cert& cert);
+  Status VerifyCertChainUnlocked(const Cert& cert) WARN_UNUSED_RESULT;
 
-  // Owned SSL context.
+  // Protects all members.
+  //
+  // Taken in write mode when any changes are modifying the underlying SSL_CTX
+  // using a mutating method (eg SSL_CTX_use_*) or when changing the value of
+  // any of our own member variables.
+  mutable RWMutex lock_;
   c_unique_ptr<SSL_CTX> ctx_;
-
-  // Protexts trusted_cert_count_, has_cert_ and csr_, as well as ctx_ when it
-  // needs to be updated transactionally with has_cert_ and csr_.
-  mutable Mutex lock_;
   int32_t trusted_cert_count_;
   bool has_cert_;
+  bool is_external_cert_;
   boost::optional<CertSignRequest> csr_;
 };
 

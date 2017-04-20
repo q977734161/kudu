@@ -51,19 +51,17 @@ TAG_FLAG(consensus_rpc_timeout_ms, advanced);
 
 DEFINE_int32(raft_get_node_instance_timeout_ms, 30000,
              "Timeout for retrieving node instance data over RPC.");
-TAG_FLAG(consensus_rpc_timeout_ms, hidden);
-
-DECLARE_int32(raft_heartbeat_interval_ms);
+TAG_FLAG(raft_get_node_instance_timeout_ms, hidden);
 
 DEFINE_double(fault_crash_on_leader_request_fraction, 0.0,
               "Fraction of the time when the leader will crash just before sending an "
               "UpdateConsensus RPC. (For testing only!)");
+TAG_FLAG(fault_crash_on_leader_request_fraction, unsafe);
 
 DEFINE_double(fault_crash_after_leader_request_fraction, 0.0,
               "Fraction of the time when the leader will crash on getting a response for an "
               "UpdateConsensus RPC. (For testing only!)");
-
-TAG_FLAG(fault_crash_on_leader_request_fraction, unsafe);
+TAG_FLAG(fault_crash_after_leader_request_fraction, unsafe);
 
 
 // Allow for disabling Tablet Copy in unit tests where we want to test
@@ -73,6 +71,9 @@ DEFINE_bool(enable_tablet_copy, true,
             "detects that a follower is out of date or does not have a tablet "
             "replica. For testing purposes only.");
 TAG_FLAG(enable_tablet_copy, unsafe);
+
+DECLARE_int32(raft_heartbeat_interval_ms);
+
 
 namespace kudu {
 namespace consensus {
@@ -325,19 +326,18 @@ Status Peer::PrepareTabletCopyRequest() {
 
 void Peer::ProcessTabletCopyResponse() {
   // If the peer is already closed return.
-  {
-    std::unique_lock<simple_spinlock> lock(peer_lock_);
-    if (closed_) {
-      return;
-    }
-    CHECK(request_pending_);
-    request_pending_ = false;
+  std::unique_lock<simple_spinlock> lock(peer_lock_);
+  if (closed_) {
+    return;
   }
+  CHECK(request_pending_);
+  request_pending_ = false;
 
   if (controller_.status().ok() && tc_response_.has_error()) {
     // ALREADY_INPROGRESS is expected, so we do not log this error.
     if (tc_response_.error().code() ==
         TabletServerErrorPB::TabletServerErrorPB::ALREADY_INPROGRESS) {
+      lock.unlock();
       queue_->NotifyPeerIsResponsiveDespiteError(peer_pb_.permanent_uuid());
     } else {
       LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to begin Tablet Copy on peer: "

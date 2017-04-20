@@ -34,7 +34,7 @@ PREFIX_COMMON=$TP_DIR/installed/common
 PREFIX_DEPS=$TP_DIR/installed/uninstrumented
 PREFIX_DEPS_TSAN=$TP_DIR/installed/tsan
 
-GFLAGS_VERSION=2.1.2
+GFLAGS_VERSION=2.2.0
 GFLAGS_NAME=gflags-$GFLAGS_VERSION
 GFLAGS_SOURCE=$TP_SOURCE_DIR/$GFLAGS_NAME
 
@@ -146,7 +146,7 @@ LLVM_SOURCE=$TP_SOURCE_DIR/$LLVM_NAME
 
 # Python 2.7 is required to build LLVM 3.6+. It is only built and installed if
 # the system Python version is not 2.7.
-PYTHON_VERSION=2.7.10
+PYTHON_VERSION=2.7.13
 PYTHON_NAME=python-$PYTHON_VERSION
 PYTHON_SOURCE=$TP_SOURCE_DIR/$PYTHON_NAME
 
@@ -175,3 +175,14 @@ OPENSSL_WORKAROUND_DIR="$TP_DIR/installed/openssl-el6-workaround"
 BREAKPAD_VERSION=f78d953511606348173911ae0b62572ebec1bbc4
 BREAKPAD_NAME=breakpad-$BREAKPAD_VERSION
 BREAKPAD_SOURCE=$TP_SOURCE_DIR/$BREAKPAD_NAME
+
+# Hash of the sparsehash-c11 git revision to use.
+# (from http://github.com/sparsehash/sparsehash-c11)
+#
+# To re-build this tarball use the following in the sparsehash-c11 repo:
+#  export NAME=sparsehash-c11-$(git rev-parse HEAD)
+#  git archive HEAD --prefix=$NAME/ -o /tmp/$NAME.tar.gz
+#  s3cmd put -P /tmp/$NAME.tar.gz s3://cloudera-thirdparty-libs/$NAME.tar.gz
+SPARSEHASH_VERSION=47a55825ca3b35eab1ca22b7ab82b9544e32a9af
+SPARSEHASH_NAME=sparsehash-c11-$SPARSEHASH_VERSION
+SPARSEHASH_SOURCE=$TP_SOURCE_DIR/$SPARSEHASH_NAME

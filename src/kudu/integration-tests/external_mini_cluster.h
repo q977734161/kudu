@@ -46,14 +46,6 @@ class NodeInstancePB;
 class Sockaddr;
 class Subprocess;
 
-namespace master {
-class MasterServiceProxy;
-} // namespace master
-
-namespace rpc {
-class Messenger;
-} // namespace rpc
-
 namespace server {
 class ServerStatusPB;
 } // namespace server
@@ -235,17 +227,9 @@ class ExternalMiniCluster : public MiniClusterBase {
     return masters_.size();
   }
 
-  // Return the client messenger used by the ExternalMiniCluster.
-  std::shared_ptr<rpc::Messenger> messenger();
-
-  // If the cluster is configured for a single non-distributed master,
-  // return a proxy to that master. Requires that the single master is
-  // running.
-  std::shared_ptr<master::MasterServiceProxy> master_proxy();
-
-  // Returns an RPC proxy to the master at 'idx'. Requires that the
-  // master at 'idx' is running.
-  std::shared_ptr<master::MasterServiceProxy> master_proxy(int idx);
+  std::shared_ptr<rpc::Messenger> messenger() const override;
+  std::shared_ptr<master::MasterServiceProxy> master_proxy() const override;
+  std::shared_ptr<master::MasterServiceProxy> master_proxy(int idx) const override;
 
   // Wait until the number of registered tablet servers reaches the given count
   // on all of the running masters. Returns Status::TimedOut if the desired
@@ -345,7 +329,11 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
 
   HostPort bound_rpc_hostport() const;
   Sockaddr bound_rpc_addr() const;
+
+  // Return the host/port that this daemon is bound to for HTTP.
+  // May return an uninitialized HostPort if HTTP is disabled.
   HostPort bound_http_hostport() const;
+
   const NodeInstancePB& instance_id() const;
   const std::string& uuid() const;
 
@@ -429,6 +417,7 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   friend class RefCountedThreadSafe<ExternalDaemon>;
   virtual ~ExternalDaemon();
 
+  // Starts a process with the given flags.
   Status StartProcess(const std::vector<std::string>& user_flags);
 
   // Wait for the process to exit, and then call 'wait_status_predicate'
@@ -515,6 +504,8 @@ class ExternalMaster : public ExternalDaemon {
   Status WaitForCatalogManager() WARN_UNUSED_RESULT;
 
  private:
+  std::vector<std::string> GetCommonFlags() const;
+
   friend class RefCountedThreadSafe<ExternalMaster>;
   virtual ~ExternalMaster();
 };

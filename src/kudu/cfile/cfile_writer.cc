@@ -36,11 +36,6 @@
 #include "kudu/util/logging.h"
 #include "kudu/util/pb_util.h"
 
-using google::protobuf::RepeatedPtrField;
-using kudu::fs::ScopedWritableBlockCloser;
-using kudu::fs::WritableBlock;
-using std::string;
-
 DEFINE_int32(cfile_default_block_size, 256*1024, "The default block size to use in cfiles");
 TAG_FLAG(cfile_default_block_size, advanced);
 
@@ -65,6 +60,12 @@ DEFINE_string(cfile_do_on_finish, "flush",
               "What to do to cfile blocks when writing is finished. "
               "Possible values are 'close', 'flush', or 'nothing'.");
 TAG_FLAG(cfile_do_on_finish, experimental);
+
+using google::protobuf::RepeatedPtrField;
+using kudu::fs::ScopedWritableBlockCloser;
+using kudu::fs::WritableBlock;
+using std::string;
+using std::unique_ptr;
 
 namespace kudu {
 namespace cfile {
@@ -99,7 +100,7 @@ WriterOptions::WriterOptions()
 CFileWriter::CFileWriter(const WriterOptions &options,
                          const TypeInfo* typeinfo,
                          bool is_nullable,
-                         gscoped_ptr<WritableBlock> block)
+                         unique_ptr<WritableBlock> block)
   : block_(std::move(block)),
     off_(0),
     value_count_(0),
@@ -440,13 +441,6 @@ Status CFileWriter::AppendRawBlock(const vector<Slice> &data_slices,
   }
 
   return s;
-}
-
-size_t CFileWriter::written_size() const {
-  // This is a low estimate, but that's OK -- this is checked after every block
-  // write during flush/compact, so better to give a fast slightly-inaccurate result
-  // than spend a lot of effort trying to improve accuracy by a few KB.
-  return off_;
 }
 
 Status CFileWriter::AddBlock(const vector<Slice> &data_slices,

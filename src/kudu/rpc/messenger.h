@@ -74,6 +74,20 @@ struct AcceptorPoolInfo {
   Sockaddr bind_address_;
 };
 
+// Authentication configuration for RPC connections.
+enum class RpcAuthentication {
+  DISABLED,
+  OPTIONAL,
+  REQUIRED,
+};
+
+// Encryption configuration for RPC connections.
+enum class RpcEncryption {
+  DISABLED,
+  OPTIONAL,
+  REQUIRED,
+};
+
 // Used to construct a Messenger.
 class MessengerBuilder {
  public:
@@ -104,9 +118,7 @@ class MessengerBuilder {
   MessengerBuilder &set_metric_entity(const scoped_refptr<MetricEntity>& metric_entity);
 
   // Configure the messenger to enable TLS encryption on inbound connections.
-  // The 'server_uuid' will be used as the subject name for the server's
-  // certificate.
-  MessengerBuilder& enable_inbound_tls(std::string server_uuid);
+  MessengerBuilder& enable_inbound_tls();
 
   Status Build(std::shared_ptr<Messenger> *msgr);
 
@@ -118,7 +130,7 @@ class MessengerBuilder {
   int max_negotiation_threads_;
   MonoDelta coarse_timer_granularity_;
   scoped_refptr<MetricEntity> metric_entity_;
-  boost::optional<string> enable_inbound_tls_server_uuid_;
+  bool enable_inbound_tls_;
 };
 
 // A Messenger is a container for the reactor threads which run event loops
@@ -199,6 +211,9 @@ class Messenger {
 
   const security::TokenVerifier& token_verifier() const { return *token_verifier_; }
   security::TokenVerifier* mutable_token_verifier() { return token_verifier_.get(); }
+  std::shared_ptr<security::TokenVerifier> shared_token_verifier() const {
+    return token_verifier_;
+  }
 
   boost::optional<security::SignedTokenPB> authn_token() const {
     std::lock_guard<simple_spinlock> l(authn_token_lock_);
@@ -208,6 +223,9 @@ class Messenger {
     std::lock_guard<simple_spinlock> l(authn_token_lock_);
     authn_token_ = token;
   }
+
+  RpcAuthentication authentication() const { return authentication_; }
+  RpcEncryption encryption() const { return encryption_; }
 
   ThreadPool* negotiation_pool() const { return negotiation_pool_.get(); }
 
@@ -249,6 +267,13 @@ class Messenger {
 
   bool closing_;
 
+  // Whether to require authentication and encryption on the connections managed
+  // by this messenger.
+  // TODO(KUDU-1928): scope these to individual proxies, so that messengers can be
+  // reused by different clients.
+  RpcAuthentication authentication_;
+  RpcEncryption encryption_;
+
   // Pools which are listening on behalf of this messenger.
   // Note that the user may have called Shutdown() on one of these
   // pools, so even though we retain the reference, it may no longer
@@ -265,7 +290,7 @@ class Messenger {
   std::unique_ptr<security::TlsContext> tls_context_;
 
   // A TokenVerifier, which can verify client provided authentication tokens.
-  std::unique_ptr<security::TokenVerifier> token_verifier_;
+  std::shared_ptr<security::TokenVerifier> token_verifier_;
 
   // An optional token, which can be used to authenticate to a server.
   mutable simple_spinlock authn_token_lock_;

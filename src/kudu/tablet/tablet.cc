@@ -39,6 +39,7 @@
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/stl_util.h"
+#include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/server/hybrid_clock.h"
@@ -64,6 +65,7 @@
 #include "kudu/util/maintenance_manager.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/trace.h"
 #include "kudu/util/url-coding.h"
@@ -130,6 +132,13 @@ DEFINE_int32(max_encoded_key_size_bytes, 16 * 1024,
              "Attempting to insert a row with a larger encoded composite key will "
              "result in an error.");
 TAG_FLAG(max_encoded_key_size_bytes, unsafe);
+
+DEFINE_bool(enable_undo_delta_block_gc, true,
+    "Whether to enable undo delta block garbage collection. "
+    "This only affects the undo delta block deletion background task, and "
+    "doesn't control whether compactions delete ancient history. "
+    "To change what is considered ancient history use --tablet_history_max_age_sec");
+TAG_FLAG(enable_undo_delta_block_gc, evolving);
 
 METRIC_DEFINE_entity(tablet);
 METRIC_DEFINE_gauge_size(tablet, memrowset_size, "MemRowSet Memory Usage",
@@ -281,7 +290,7 @@ Status Tablet::GetMappedReadProjection(const Schema& projection,
   return cur_schema->GetMappedReadProjection(projection, mapped_projection);
 }
 
-BloomFilterSizing Tablet::bloom_sizing() const {
+BloomFilterSizing Tablet::DefaultBloomSizing() {
   return BloomFilterSizing::BySizeAndFPRate(FLAGS_tablet_bloom_block_size,
                                             FLAGS_tablet_bloom_target_fp_rate);
 }
@@ -330,17 +339,10 @@ Status Tablet::DecodeWriteOperations(const Schema* client_schema,
   RETURN_NOT_OK(dec.DecodeOperations(&ops));
   TRACE_COUNTER_INCREMENT("num_ops", ops.size());
 
-  // Create RowOp objects for each
-  vector<RowOp*> row_ops;
-  row_ops.reserve(ops.size());
-  for (const DecodedRowOperation& op : ops) {
-    row_ops.push_back(new RowOp(op));
-  }
-
   // Important to set the schema before the ops -- we need the
   // schema in order to stringify the ops.
   tx_state->set_schema_at_decode_time(schema());
-  tx_state->swap_row_ops(&row_ops);
+  tx_state->SetRowOps(std::move(ops));
 
   return Status::OK();
 }
@@ -410,6 +412,35 @@ void Tablet::StartTransaction(WriteTransactionState* tx_state) {
   tx_state->SetMvccTx(std::move(mvcc_tx));
 }
 
+bool Tablet::ValidateOpOrMarkFailed(RowOp* op) const {
+  if (op->validated) return true;
+
+  Status s = ValidateOp(*op);
+  if (PREDICT_FALSE(!s.ok())) {
+    // TODO(todd): add a metric tracking the number of invalid ops.
+    op->SetFailed(s);
+    return false;
+  }
+  op->validated = true;
+  return true;
+}
+
+Status Tablet::ValidateOp(const RowOp& op) const {
+  switch (op.decoded_op.type) {
+    case RowOperationsPB::INSERT:
+    case RowOperationsPB::UPSERT:
+      return ValidateInsertOrUpsertUnlocked(op);
+
+    case RowOperationsPB::UPDATE:
+    case RowOperationsPB::DELETE:
+      return ValidateMutateUnlocked(op);
+
+    default:
+      LOG_WITH_PREFIX(FATAL) << RowOperationsPB::Type_Name(op.decoded_op.type);
+  }
+  abort(); // unreachable
+}
+
 Status Tablet::ValidateInsertOrUpsertUnlocked(const RowOp& op) const {
   // Check that no individual cell is larger than the specified max.
   ConstContiguousRow row(schema(), op.decoded_op.row_data);
@@ -474,33 +505,22 @@ Status Tablet::ValidateMutateUnlocked(const RowOp& op) const {
 Status Tablet::InsertOrUpsertUnlocked(WriteTransactionState *tx_state,
                                       RowOp* op,
                                       ProbeStats* stats) {
-
-  Status s = ValidateInsertOrUpsertUnlocked(*op);
-  if (PREDICT_FALSE(!s.ok())) {
-    // TODO(todd): add a metric tracking the number of invalid ops.
-    op->SetFailed(s);
-    return s;
-  }
+  DCHECK(op->checked_present);
+  DCHECK(op->validated);
 
   const bool is_upsert = op->decoded_op.type == RowOperationsPB::UPSERT;
   const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
 
-  // First, ensure that it is a unique key by checking all the open RowSets.
-  vector<RowSet *> to_check = FindRowSetsToCheck(op, comps);
-  for (RowSet *rowset : to_check) {
-    bool present = false;
-    RETURN_NOT_OK(rowset->CheckRowPresent(*op->key_probe, &present, stats));
-    if (present) {
-      if (is_upsert) {
-        return ApplyUpsertAsUpdate(tx_state, op, rowset, stats);
-      }
-      Status s = Status::AlreadyPresent("key already present");
-      if (metrics_) {
-        metrics_->insertions_failed_dup_key->Increment();
-      }
-      op->SetFailed(s);
-      return s;
+  if (op->present_in_rowset) {
+    if (is_upsert) {
+      return ApplyUpsertAsUpdate(tx_state, op, op->present_in_rowset, stats);
     }
+    Status s = Status::AlreadyPresent("key already present");
+    if (metrics_) {
+      metrics_->insertions_failed_dup_key->Increment();
+    }
+    op->SetFailed(s);
+    return s;
   }
 
   Timestamp ts = tx_state->timestamp();
@@ -511,7 +531,7 @@ Status Tablet::InsertOrUpsertUnlocked(WriteTransactionState *tx_state,
 
   // Now try to op into memrowset. The memrowset itself will return
   // AlreadyPresent if it has already been oped there.
-  s = comps->memrowset->Insert(ts, row, tx_state->op_id());
+  Status s = comps->memrowset->Insert(ts, row, tx_state->op_id());
   if (s.ok()) {
     op->SetInsertSucceeded(comps->memrowset->mrs_id());
   } else {
@@ -575,7 +595,7 @@ Status Tablet::ApplyUpsertAsUpdate(WriteTransactionState* tx_state,
   return s;
 }
 
-vector<RowSet*> Tablet::FindRowSetsToCheck(RowOp* op,
+vector<RowSet*> Tablet::FindRowSetsToCheck(const RowOp* op,
                                            const TabletComponents* comps) {
   vector<RowSet*> to_check;
   if (PREDICT_TRUE(!op->orig_result_from_log_)) {
@@ -618,55 +638,32 @@ vector<RowSet*> Tablet::FindRowSetsToCheck(RowOp* op,
 Status Tablet::MutateRowUnlocked(WriteTransactionState *tx_state,
                                  RowOp* mutate,
                                  ProbeStats* stats) {
-  // Validate the mutation.
-  Status s = ValidateMutateUnlocked(*mutate);
-  if (!s.ok()) {
-    mutate->SetFailed(s);
-    return s;
-  }
+  DCHECK(mutate->checked_present);
+  DCHECK(mutate->validated);
 
   gscoped_ptr<OperationResultPB> result(new OperationResultPB());
   const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
   Timestamp ts = tx_state->timestamp();
 
-  // First try to update in memrowset.
-  s = comps->memrowset->MutateRow(ts,
-                            *mutate->key_probe,
-                            mutate->decoded_op.changelist,
-                            tx_state->op_id(),
-                            stats,
-                            result.get());
-  if (s.ok()) {
+  // If we found the row in any existing RowSet, mutate it there. Otherwise
+  // attempt to mutate in the MRS.
+  RowSet* rs_to_attempt = mutate->present_in_rowset ?
+      mutate->present_in_rowset : comps->memrowset.get();
+  Status s = rs_to_attempt->MutateRow(ts,
+                                      *mutate->key_probe,
+                                      mutate->decoded_op.changelist,
+                                      tx_state->op_id(),
+                                      stats,
+                                      result.get());
+  if (PREDICT_TRUE(s.ok())) {
     mutate->SetMutateSucceeded(std::move(result));
-    return s;
-  }
-  if (!s.IsNotFound()) {
+  } else {
+    if (s.IsNotFound()) {
+      // Replace internal error messages with one more suitable for users.
+      s = Status::NotFound("key not found");
+    }
     mutate->SetFailed(s);
-    return s;
   }
-
-  // Next, check the disk rowsets.
-
-  vector<RowSet *> to_check = FindRowSetsToCheck(mutate, comps);
-  for (RowSet *rs : to_check) {
-    s = rs->MutateRow(ts,
-                      *mutate->key_probe,
-                      mutate->decoded_op.changelist,
-                      tx_state->op_id(),
-                      stats,
-                      result.get());
-    if (s.ok()) {
-      mutate->SetMutateSucceeded(std::move(result));
-      return s;
-    }
-    if (!s.IsNotFound()) {
-      mutate->SetFailed(s);
-      return s;
-    }
-  }
-
-  s = Status::NotFound("key not found");
-  mutate->SetFailed(s);
   return s;
 }
 
@@ -676,26 +673,148 @@ void Tablet::StartApplying(WriteTransactionState* tx_state) {
   tx_state->set_tablet_components(components_);
 }
 
-void Tablet::ApplyRowOperations(WriteTransactionState* tx_state) {
-  // Allocate the ProbeStats objects from the transaction's arena, so
-  // they're all contiguous and we don't need to do any central allocation.
+void Tablet::BulkCheckPresence(WriteTransactionState* tx_state) {
   int num_ops = tx_state->row_ops().size();
-  ProbeStats* stats_array = static_cast<ProbeStats*>(
-      tx_state->arena()->AllocateBytesAligned(sizeof(ProbeStats) * num_ops,
-                                              alignof(ProbeStats)));
 
-  StartApplying(tx_state);
-  int i = 0;
-  for (RowOp* row_op : tx_state->row_ops()) {
-    ProbeStats* stats = &stats_array[i++];
-    // Manually run the constructor to clear the stats to 0 before collecting
-    // them.
-    new (stats) ProbeStats();
-    ApplyRowOperation(tx_state, row_op, stats);
+  // TODO(todd) determine why we sometimes get empty writes!
+  if (PREDICT_FALSE(num_ops == 0)) return;
+
+  // The compiler seems to be bad at hoisting this load out of the loops,
+  // so load it up top.
+  RowOp* const * row_ops_base = tx_state->row_ops().data();
+
+  // Run all of the ops through the RowSetTree.
+  vector<pair<Slice, int>> keys_and_indexes;
+  keys_and_indexes.reserve(num_ops);
+  for (int i = 0; i < num_ops; i++) {
+    RowOp* op = row_ops_base[i];
+    // If the op already failed in validation, or if we've got the original result
+    // filled in already during replay, then we don't need to consult the RowSetTree.
+    if (op->has_result() || op->orig_result_from_log_) continue;
+    keys_and_indexes.emplace_back(op->key_probe->encoded_key_slice(), i);
   }
 
-  if (metrics_) {
-    metrics_->AddProbeStats(stats_array, num_ops, tx_state->arena());
+  // Sort the query points by their probe keys, retaining the equivalent indexes.
+  //
+  // It's important to do a stable-sort here so that the 'unique' call
+  // below retains only the _first_ op the user specified, instead of
+  // an arbitrary one.
+  //
+  // TODO(todd): benchmark stable_sort vs using sort() and falling back to
+  // comparing 'a.second' when a.first == b.first. Some microbenchmarks
+  // seem to indicate stable_sort is actually faster.
+  // TODO(todd): could also consider weaving in a check in the loop above to
+  // see if the incoming batch is already totally-ordered and in that case
+  // skip this sort and std::unique call.
+  std::stable_sort(keys_and_indexes.begin(), keys_and_indexes.end(),
+                   [](const pair<Slice, int>& a,
+                      const pair<Slice, int>& b) {
+                     return a.first.compare(b.first) < 0;
+                   });
+  // If the batch has more than one operation for the same row, then we can't
+  // use the up-front presence optimization on those operations, since the
+  // first operation may change the result of the later presence-checks.
+  keys_and_indexes.erase(std::unique(
+      keys_and_indexes.begin(), keys_and_indexes.end(),
+      [](const pair<Slice, int>& a,
+         const pair<Slice, int>& b) {
+        return a.first == b.first;
+      }), keys_and_indexes.end());
+
+  // Unzip the keys into a separate array (since the RowSetTree API just wants a vector of
+  // Slices)
+  vector<Slice> keys(keys_and_indexes.size());
+  for (int i = 0; i < keys.size(); i++) {
+    keys[i] = keys_and_indexes[i].first;
+  }
+
+  // Actually perform the presence checks. We use the "bulk query" functionality
+  // provided by RowSetTree::ForEachRowSetContainingKeys(), which yields results
+  // via a callback, with grouping guarantees that callbacks for the same RowSet
+  // will be grouped together with increasing query keys.
+  //
+  // We want to process each such "group" (set of subsequent calls for the same
+  // RowSet) one at a time. So, the callback itself aggregates results into
+  // 'pending_group' and then calls 'ProcessPendingGroup' when the next group
+  // begins.
+  vector<pair<RowSet*, int>> pending_group;
+  const auto& ProcessPendingGroup = [&]() {
+    if (pending_group.empty()) return;
+    // Check invariant of the batch RowSetTree query: within each output group
+    // we should have fully-sorted keys.
+    DCHECK(std::is_sorted(pending_group.begin(), pending_group.end(),
+                          [&](const pair<RowSet*, int>& a,
+                              const pair<RowSet*, int>& b) {
+                            auto s_a = keys[a.second];
+                            auto s_b = keys[b.second];
+                            return s_a.compare(s_b) < 0;
+                          }));
+    RowSet* rs = pending_group[0].first;
+    for (auto it = pending_group.begin();
+         it != pending_group.end();
+         ++it) {
+      DCHECK_EQ(it->first, rs) << "All results within a group should be for the same RowSet";
+      int op_idx = keys_and_indexes[it->second].second;
+      RowOp* op = row_ops_base[op_idx];
+      if (op->present_in_rowset) {
+        // Already found this op present somewhere.
+        continue;
+      }
+
+      // TODO(todd) is CHECK_OK correct? it used to be that errors here
+      // would just be silently ignored, so this seems at least an improvement.
+      bool present = false;
+      CHECK_OK(rs->CheckRowPresent(*op->key_probe, &present, tx_state->mutable_op_stats(op_idx)));
+      if (present) {
+        op->present_in_rowset = rs;
+      }
+    }
+    pending_group.clear();
+  };
+
+  const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
+  comps->rowsets->ForEachRowSetContainingKeys(
+      keys,
+      [&](RowSet* rs, int i) {
+        if (!pending_group.empty() && rs != pending_group.back().first) {
+          ProcessPendingGroup();
+        }
+        pending_group.emplace_back(rs, i);
+      });
+  // Process the last group.
+  ProcessPendingGroup();
+
+  // Mark all of the ops as having been checked.
+  // TODO(todd): this could potentially be weaved into the std::unique() call up
+  // above to avoid some cache misses.
+  for (auto& p : keys_and_indexes) {
+    row_ops_base[p.second]->checked_present = true;
+  }
+}
+
+void Tablet::ApplyRowOperations(WriteTransactionState* tx_state) {
+  int num_ops = tx_state->row_ops().size();
+
+  StartApplying(tx_state);
+
+  // Validate all of the ops.
+  for (RowOp* op : tx_state->row_ops()) {
+    ValidateOpOrMarkFailed(op);
+  }
+
+  BulkCheckPresence(tx_state);
+
+  // Actually apply the ops.
+  for (int op_idx = 0; op_idx < num_ops; op_idx++) {
+    RowOp* row_op = tx_state->row_ops()[op_idx];
+    if (row_op->has_result()) continue;
+
+    ApplyRowOperation(tx_state, row_op, tx_state->mutable_op_stats(op_idx));
+    DCHECK(row_op->has_result());
+  }
+
+  if (metrics_ && num_ops > 0) {
+    metrics_->AddProbeStats(tx_state->mutable_op_stats(0), num_ops, tx_state->arena());
   }
 }
 
@@ -707,6 +826,27 @@ void Tablet::ApplyRowOperation(WriteTransactionState* tx_state,
   DCHECK(tx_state != nullptr) << "must have a WriteTransactionState";
   DCHECK(tx_state->op_id().IsInitialized()) << "TransactionState OpId needed for anchoring";
   DCHECK_EQ(tx_state->schema_at_decode_time(), schema());
+
+  if (!ValidateOpOrMarkFailed(row_op)) {
+    return;
+  }
+
+  // If we were unable to check rowset presence in batch (e.g. because we are processing
+  // a batch which contains some duplicate keys) we need to do so now.
+  if (PREDICT_FALSE(!row_op->checked_present)) {
+    vector<RowSet *> to_check = FindRowSetsToCheck(row_op, tx_state->tablet_components());
+    for (RowSet *rowset : to_check) {
+      bool present = false;
+      // TODO(todd) is CHECK_OK correct? it used to be that errors here
+      // would just be silently ignored, so this seems at least an improvement.
+      CHECK_OK(rowset->CheckRowPresent(*row_op->key_probe, &present, stats));
+      if (present) {
+        row_op->present_in_rowset = rowset;
+        break;
+      }
+    }
+    row_op->checked_present = true;
+  }
 
   switch (row_op->decoded_op.type) {
     case RowOperationsPB::INSERT:
@@ -915,10 +1055,6 @@ Status Tablet::FlushInternal(const RowSetsInCompaction& input,
 
 Status Tablet::CreatePreparedAlterSchema(AlterSchemaTransactionState *tx_state,
                                          const Schema* schema) {
-  if (!key_schema_.KeyEquals(*schema)) {
-    return Status::InvalidArgument("Schema keys cannot be altered",
-                                   schema->CreateKeyProjection().ToString());
-  }
 
   if (!schema->has_column_ids()) {
     // this probably means that the request is not from the Master
@@ -935,8 +1071,8 @@ Status Tablet::CreatePreparedAlterSchema(AlterSchemaTransactionState *tx_state,
 }
 
 Status Tablet::AlterSchema(AlterSchemaTransactionState *tx_state) {
-  DCHECK(key_schema_.KeyEquals(*DCHECK_NOTNULL(tx_state->schema()))) <<
-    "Schema keys cannot be altered";
+  DCHECK(key_schema_.KeyTypeEquals(*DCHECK_NOTNULL(tx_state->schema()))) <<
+    "Schema keys cannot be altered(except name)";
 
   // Prevent any concurrent flushes. Otherwise, we run into issues where
   // we have an MRS in the rowset tree, and we can't alter its schema
@@ -1117,6 +1253,12 @@ void Tablet::RegisterMaintenanceOps(MaintenanceManager* maint_mgr) {
   gscoped_ptr<MaintenanceOp> major_delta_compact_op(new MajorDeltaCompactionOp(this));
   maint_mgr->RegisterOp(major_delta_compact_op.get());
   maintenance_ops_.push_back(major_delta_compact_op.release());
+
+  if (FLAGS_enable_undo_delta_block_gc) {
+    gscoped_ptr<MaintenanceOp> undo_delta_block_gc_op(new UndoDeltaBlockGCOp(this));
+    maint_mgr->RegisterOp(undo_delta_block_gc_op.get());
+    maintenance_ops_.push_back(undo_delta_block_gc_op.release());
+  }
 }
 
 void Tablet::UnregisterMaintenanceOps() {
@@ -1167,7 +1309,7 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
   shared_ptr<CompactionInput> merge;
   RETURN_NOT_OK(input.CreateCompactionInput(flush_snap, schema(), &merge));
 
-  RollingDiskRowSetWriter drsw(metadata_.get(), merge->schema(), bloom_sizing(),
+  RollingDiskRowSetWriter drsw(metadata_.get(), merge->schema(), DefaultBloomSizing(),
                                compaction_policy_->target_rowset_size());
   RETURN_NOT_OK_PREPEND(drsw.Open(), "Failed to open DiskRowSet for flush");
 
@@ -1637,6 +1779,31 @@ Status Tablet::FlushBiggestDMS() {
   return max_size > 0 ? biggest_drs->FlushDeltas() : Status::OK();
 }
 
+Status Tablet::FlushAllDMSForTests() {
+  CHECK_EQ(state_, kOpen);
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+  for (const auto& rowset : comps->rowsets->all_rowsets()) {
+    RETURN_NOT_OK(rowset->FlushDeltas());
+  }
+  return Status::OK();
+}
+
+Status Tablet::MajorCompactAllDeltaStoresForTests() {
+  LOG_WITH_PREFIX(INFO) << "Major compacting all delta stores, for tests";
+  CHECK_EQ(state_, kOpen);
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+  for (const auto& rs : comps->rowsets->all_rowsets()) {
+    if (!rs->IsAvailableForCompaction()) continue;
+    DiskRowSet* drs = down_cast<DiskRowSet*>(rs.get());
+    RETURN_NOT_OK(drs->delta_tracker()->InitAllDeltaStoresForTests(DeltaTracker::REDOS_ONLY));
+    RETURN_NOT_OK_PREPEND(drs->MajorCompactDeltaStores(
+        GetHistoryGcOpts()), "Failed major delta compaction on " + rs->ToString());
+  }
+  return Status::OK();
+}
+
 Status Tablet::CompactWorstDeltas(RowSet::DeltaCompactionType type) {
   CHECK_EQ(state_, kOpen);
   shared_ptr<RowSet> rs;
@@ -1698,6 +1865,172 @@ double Tablet::GetPerfImprovementForBestDeltaCompactUnlocked(RowSet::DeltaCompac
     *rs = worst_rs;
   }
   return worst_delta_perf;
+}
+
+Status Tablet::EstimateBytesInPotentiallyAncientUndoDeltas(int64_t* bytes) {
+  DCHECK(bytes);
+
+  Timestamp ancient_history_mark;
+  if (!Tablet::GetTabletAncientHistoryMark(&ancient_history_mark)) {
+    VLOG_WITH_PREFIX(1) << "Cannot get ancient history mark. "
+                           "The clock is likely not a hybrid clock";
+    return Status::OK();
+  }
+
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+
+  int64_t tablet_bytes = 0;
+  for (const auto& rowset : comps->rowsets->all_rowsets()) {
+    int64_t rowset_bytes;
+    RETURN_NOT_OK(rowset->EstimateBytesInPotentiallyAncientUndoDeltas(ancient_history_mark,
+                                                                      &rowset_bytes));
+    tablet_bytes += rowset_bytes;
+  }
+
+  metrics_->undo_delta_block_estimated_retained_bytes->set_value(tablet_bytes);
+  *bytes = tablet_bytes;
+  return Status::OK();
+}
+
+Status Tablet::InitAncientUndoDeltas(MonoDelta time_budget, int64_t* bytes_in_ancient_undos) {
+  MonoTime tablet_init_start = MonoTime::Now();
+
+  Timestamp ancient_history_mark;
+  if (!Tablet::GetTabletAncientHistoryMark(&ancient_history_mark)) {
+    VLOG_WITH_PREFIX(1) << "Cannot get ancient history mark. "
+                           "The clock is likely not a hybrid clock";
+    return Status::OK();
+  }
+
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+
+  RowSetVector rowsets = comps->rowsets->all_rowsets();
+
+  // Estimate the size of the ancient undos in each rowset so that we can
+  // initialize them greedily.
+  vector<pair<size_t, int64_t>> rowset_ancient_undos_est_sizes; // index, bytes
+  rowset_ancient_undos_est_sizes.reserve(rowsets.size());
+  for (size_t i = 0; i < rowsets.size(); i++) {
+    const auto& rowset = rowsets[i];
+    int64_t bytes;
+    RETURN_NOT_OK(rowset->EstimateBytesInPotentiallyAncientUndoDeltas(ancient_history_mark,
+                                                                      &bytes));
+    rowset_ancient_undos_est_sizes.emplace_back(i, bytes);
+  }
+
+  // Sort the rowsets in descending size order to optimize for the worst offenders.
+  std::sort(rowset_ancient_undos_est_sizes.begin(), rowset_ancient_undos_est_sizes.end(),
+            [&](const pair<size_t, int64_t>& a, const pair<size_t, int64_t>& b) {
+              return a.second > b.second; // Descending order.
+            });
+
+  // Begin timeout / deadline countdown here in case the above takes some time.
+  MonoTime deadline = time_budget.Initialized() ? MonoTime::Now() + time_budget : MonoTime();
+
+  // Initialize the rowsets largest-first.
+  int64_t tablet_bytes_in_ancient_undos = 0;
+  for (const auto& rs_est_size : rowset_ancient_undos_est_sizes) {
+    size_t index = rs_est_size.first;
+    const auto& rowset = rowsets[index];
+    int64_t rowset_blocks_initialized;
+    int64_t rowset_bytes_in_ancient_undos;
+    RETURN_NOT_OK(rowset->InitUndoDeltas(ancient_history_mark, deadline,
+                                         &rowset_blocks_initialized,
+                                         &rowset_bytes_in_ancient_undos));
+    tablet_bytes_in_ancient_undos += rowset_bytes_in_ancient_undos;
+  }
+
+  MonoDelta tablet_init_duration = MonoTime::Now() - tablet_init_start;
+  metrics_->undo_delta_block_gc_init_duration->Increment(
+      tablet_init_duration.ToMilliseconds());
+
+  VLOG_WITH_PREFIX(2) << Substitute("Bytes in ancient undos: $0. Init duration: $1",
+                                    HumanReadableNumBytes::ToString(tablet_bytes_in_ancient_undos),
+                                    tablet_init_duration.ToString());
+
+  if (bytes_in_ancient_undos) *bytes_in_ancient_undos = tablet_bytes_in_ancient_undos;
+  return Status::OK();
+}
+
+Status Tablet::DeleteAncientUndoDeltas(int64_t* blocks_deleted, int64_t* bytes_deleted) {
+  MonoTime tablet_delete_start = MonoTime::Now();
+
+  Timestamp ancient_history_mark;
+  if (!Tablet::GetTabletAncientHistoryMark(&ancient_history_mark)) return Status::OK();
+
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+
+  // We need to hold the compact_flush_lock for each rowset we GC undos from.
+  RowSetVector rowsets_to_gc_undos;
+  vector<std::unique_lock<std::mutex>> rowset_locks;
+  {
+    // We hold the selection lock so other threads will not attempt to select the
+    // same rowsets for compaction while we delete old undos.
+    std::lock_guard<std::mutex> compact_lock(compact_select_lock_);
+    for (const auto& rowset : comps->rowsets->all_rowsets()) {
+      if (!rowset->IsAvailableForCompaction()) {
+        continue;
+      }
+      std::unique_lock<std::mutex> lock(*rowset->compact_flush_lock(), std::try_to_lock);
+      CHECK(lock.owns_lock()) << rowset->ToString() << " unable to lock compact_flush_lock";
+      rowsets_to_gc_undos.push_back(rowset);
+      rowset_locks.push_back(std::move(lock));
+    }
+  }
+
+  int64_t tablet_blocks_deleted = 0;
+  int64_t tablet_bytes_deleted = 0;
+  for (const auto& rowset : rowsets_to_gc_undos) {
+    int64_t rowset_blocks_deleted;
+    int64_t rowset_bytes_deleted;
+    RETURN_NOT_OK(rowset->DeleteAncientUndoDeltas(ancient_history_mark,
+                                                  &rowset_blocks_deleted, &rowset_bytes_deleted));
+    tablet_blocks_deleted += rowset_blocks_deleted;
+    tablet_bytes_deleted += rowset_bytes_deleted;
+  }
+  // We flush the tablet metadata at the end because we don't flush per-RowSet
+  // for performance reasons.
+  if (tablet_blocks_deleted > 0) {
+    RETURN_NOT_OK(metadata_->Flush());
+  }
+
+  MonoDelta tablet_delete_duration = MonoTime::Now() - tablet_delete_start;
+  metrics_->undo_delta_block_gc_bytes_deleted->IncrementBy(tablet_bytes_deleted);
+  metrics_->undo_delta_block_gc_delete_duration->Increment(
+      tablet_delete_duration.ToMilliseconds());
+
+  if (blocks_deleted) *blocks_deleted = tablet_blocks_deleted;
+  if (bytes_deleted) *bytes_deleted = tablet_bytes_deleted;
+  return Status::OK();
+}
+
+int64_t Tablet::CountUndoDeltasForTests() const {
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+  int64_t sum = 0;
+  for (const auto& rowset : comps->rowsets->all_rowsets()) {
+    shared_ptr<RowSetMetadata> metadata = rowset->metadata();
+    if (metadata) {
+      sum += metadata->undo_delta_blocks().size();
+    }
+  }
+  return sum;
+}
+
+int64_t Tablet::CountRedoDeltasForTests() const {
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+  int64_t sum = 0;
+  for (const auto& rowset : comps->rowsets->all_rowsets()) {
+    shared_ptr<RowSetMetadata> metadata = rowset->metadata();
+    if (metadata) {
+      sum += metadata->redo_delta_blocks().size();
+    }
+  }
+  return sum;
 }
 
 size_t Tablet::num_rowsets() const {
@@ -1771,11 +2104,11 @@ Status Tablet::Iterator::Init(ScanSpec *spec) {
 
   switch (order_) {
     case ORDERED:
-      iter_.reset(new MergeIterator(projection_, iters));
+      iter_.reset(new MergeIterator(projection_, std::move(iters)));
       break;
     case UNORDERED:
     default:
-      iter_.reset(new UnionIterator(iters));
+      iter_.reset(new UnionIterator(std::move(iters)));
       break;
   }
 

@@ -53,11 +53,13 @@ set(KRPC_SRCS
     proxy.cc
     reactor.cc
     remote_method.cc
+    remote_user.cc
     request_tracker.cc
     result_tracker.cc
     rpc.cc
     rpc_context.cc
     rpc_controller.cc
+    rpc_sidecar.cc
     rpcz_store.cc
     sasl_common.cc
     sasl_helper.cc
@@ -124,4 +126,3 @@ ADD_KUDU_TEST(rpc-bench RUN_SERIAL true)
 ADD_KUDU_TEST(rpc-test)
 ADD_KUDU_TEST(rpc_stub-test)
 ADD_KUDU_TEST(service_queue-test)
-

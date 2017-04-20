@@ -152,6 +152,9 @@ void ReactorThread::ShutdownInternal() {
     task->Abort(aborted); // should also free the task.
   }
   scheduled_tasks_.clear();
+
+  // Remove the OpenSSL thread state.
+  ERR_remove_thread_state(nullptr);
 }
 
 ReactorTask::ReactorTask() {
@@ -344,7 +347,7 @@ Status ReactorThread::FindOrStartConnection(const ConnectionId& conn_id,
 
   // Register the new connection in our map.
   *conn = new Connection(this, conn_id.remote(), std::move(new_socket), Connection::CLIENT);
-  (*conn)->set_user_credentials(conn_id.user_credentials());
+  (*conn)->set_local_user_credentials(conn_id.user_credentials());
 
   // Kick off blocking client connection negotiation.
   Status s = StartConnectionNegotiation(*conn);
@@ -371,8 +374,10 @@ Status ReactorThread::StartConnectionNegotiation(const scoped_refptr<Connection>
   scoped_refptr<Trace> trace(new Trace());
   ADOPT_TRACE(trace.get());
   TRACE("Submitting negotiation task for $0", conn->ToString());
+  auto authentication = reactor()->messenger()->authentication();
+  auto encryption = reactor()->messenger()->encryption();
   RETURN_NOT_OK(reactor()->messenger()->negotiation_pool()->SubmitClosure(
-        Bind(&Negotiation::RunNegotiation, conn, deadline)));
+        Bind(&Negotiation::RunNegotiation, conn, authentication, encryption, deadline)));
   return Status::OK();
 }
 
@@ -435,7 +440,7 @@ void ReactorThread::DestroyConnection(Connection *conn,
 
   // Unlink connection from lists.
   if (conn->direction() == Connection::CLIENT) {
-    ConnectionId conn_id(conn->remote(), conn->user_credentials());
+    ConnectionId conn_id(conn->remote(), conn->local_user_credentials());
     auto it = client_conns_.find(conn_id);
     CHECK(it != client_conns_.end()) << "Couldn't find connection " << conn->ToString();
     client_conns_.erase(it);

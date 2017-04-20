@@ -54,6 +54,14 @@ const KuduSchema* KuduScanBatch::projection_schema() const {
   return data_->client_projection_;
 }
 
+Slice KuduScanBatch::direct_data() const {
+  return data_->direct_data_;
+}
+
+Slice KuduScanBatch::indirect_data() const {
+  return data_->indirect_data_;
+}
+
 ////////////////////////////////////////////////////////////
 // KuduScanBatch::RowPtr
 ////////////////////////////////////////////////////////////
@@ -285,6 +293,9 @@ template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<BINARY> >(int col_idx, Slice* val) const;
 
 string KuduScanBatch::RowPtr::ToString() const {
+  // Client-users calling ToString() will likely expect it to not be redacted.
+  ScopedDisableRedaction no_redaction;
+
   string ret;
   ret.append("(");
   bool first = true;

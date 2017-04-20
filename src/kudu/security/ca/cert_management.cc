@@ -37,6 +37,7 @@
 
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/security/cert.h"
+#include "kudu/security/init.h"
 #include "kudu/security/openssl_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
@@ -69,6 +70,7 @@ CertRequestGenerator::~CertRequestGenerator() {
 
 Status CertRequestGeneratorBase::GenerateRequest(const PrivateKey& key,
                                                  CertSignRequest* ret) const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(ret);
   CHECK(Initialized());
   auto req = ssl_make_unique(X509_REQ_new());
@@ -88,12 +90,10 @@ Status CertRequestGeneratorBase::GenerateRequest(const PrivateKey& key,
     } \
   } while (false)
 
-  CERT_SET_SUBJ_FIELD(config_.country, "C", "country");
-  CERT_SET_SUBJ_FIELD(config_.state, "ST", "state");
-  CERT_SET_SUBJ_FIELD(config_.locality, "L", "locality/city");
-  CERT_SET_SUBJ_FIELD(config_.org, "O", "organization");
-  CERT_SET_SUBJ_FIELD(config_.unit, "OU", "organizational unit");
-  CERT_SET_SUBJ_FIELD(config_.uuid, "CN", "common name");
+  CERT_SET_SUBJ_FIELD(config_.cn, "CN", "common name");
+  if (config_.user_id) {
+    CERT_SET_SUBJ_FIELD(*config_.user_id, "UID", "userId");
+  }
 #undef CERT_SET_SUBJ_FIELD
 
   // Set necessary extensions into the request.
@@ -109,11 +109,10 @@ Status CertRequestGeneratorBase::GenerateRequest(const PrivateKey& key,
 
 Status CertRequestGeneratorBase::PushExtension(stack_st_X509_EXTENSION* st,
                                                int32_t nid, StringPiece value) {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   auto ex = ssl_make_unique(
       X509V3_EXT_conf_nid(nullptr, nullptr, nid, const_cast<char*>(value.data())));
-  if (!ex) {
-    return Status::RuntimeError("error configuring extension");
-  }
+  OPENSSL_RET_IF_NULL(ex, "error configuring extension");
   OPENSSL_RET_NOT_OK(sk_X509_EXTENSION_push(st, ex.release()),
       "error pushing extension into the stack");
   return Status::OK();
@@ -125,15 +124,11 @@ CertRequestGenerator::CertRequestGenerator(Config config)
 
 Status CertRequestGenerator::Init() {
   InitializeOpenSSL();
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
 
   CHECK(!is_initialized_);
-  if (config_.uuid.empty()) {
-    return Status::InvalidArgument("missing end-entity UUID/name");
-  }
-  // Check that the config contain at least one entity (DNS name/IP address)
-  // to bind the generated certificate.
-  if (config_.hostnames.empty() && config_.ips.empty()) {
-    return Status::InvalidArgument("SAN: missing DNS names and IP addresses");
+  if (config_.cn.empty()) {
+    return Status::InvalidArgument("missing end-entity CN");
   }
 
   extensions_ = sk_X509_EXTENSION_new_null();
@@ -164,43 +159,13 @@ Status CertRequestGenerator::Init() {
   // (i.e. they cannot be used to sign/issue certificates).
   RETURN_NOT_OK(PushExtension(extensions_, NID_basic_constraints,
                               "critical,CA:FALSE"));
-  ostringstream san_hosts;
-  for (size_t i = 0; i < config_.hostnames.size(); ++i) {
-    const string& hostname = config_.hostnames[i];
-    if (hostname.empty()) {
-      // Basic validation: check for emptyness. Probably, more advanced
-      // validation is needed here.
-      return Status::InvalidArgument("SAN: an empty hostname");
-    }
-    if (i != 0) {
-      san_hosts << ",";
-    }
-    san_hosts << "DNS." << i << ":" << hostname;
+
+  if (config_.kerberos_principal) {
+    int nid = GetKuduKerberosPrincipalOidNid();
+    RETURN_NOT_OK(PushExtension(extensions_, nid,
+                                Substitute("ASN1:UTF8:$0", *config_.kerberos_principal)));
   }
-  ostringstream san_ips;
-  for (size_t i = 0; i < config_.ips.size(); ++i) {
-    const string& ip = config_.ips[i];
-    if (ip.empty()) {
-      // Basic validation: check for emptyness. Probably, more advanced
-      // validation is needed here.
-      return Status::InvalidArgument("SAN: an empty IP address");
-    }
-    if (i != 0) {
-      san_ips << ",";
-    }
-    san_ips << "IP." << i << ":" << ip;
-  }
-  // Encode hostname and IP address into the subjectAlternativeName attribute.
-  const string alt_name = san_hosts.str() +
-      ((!san_hosts.str().empty() && !san_ips.str().empty()) ? "," : "") +
-      san_ips.str();
-  RETURN_NOT_OK(PushExtension(extensions_, NID_subject_alt_name,
-                              alt_name.c_str()));
-  if (!config_.comment.empty()) {
-    // Add the comment if it's not empty.
-    RETURN_NOT_OK(PushExtension(extensions_, NID_netscape_comment,
-                                config_.comment.c_str()));
-  }
+
   is_initialized_ = true;
 
   return Status::OK();
@@ -228,12 +193,13 @@ CaCertRequestGenerator::~CaCertRequestGenerator() {
 
 Status CaCertRequestGenerator::Init() {
   InitializeOpenSSL();
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
 
   lock_guard<simple_spinlock> guard(lock_);
   if (is_initialized_) {
     return Status::OK();
   }
-  if (config_.uuid.empty()) {
+  if (config_.cn.empty()) {
     return Status::InvalidArgument("missing CA service UUID/name");
   }
 
@@ -250,11 +216,6 @@ Status CaCertRequestGenerator::Init() {
   // The generated certificates are for the private CA service.
   RETURN_NOT_OK(PushExtension(extensions_, NID_basic_constraints,
                               "critical,CA:TRUE"));
-  if (!config_.comment.empty()) {
-    // Add the comment if it's not empty.
-    RETURN_NOT_OK(PushExtension(extensions_, NID_netscape_comment,
-                                config_.comment.c_str()));
-  }
   is_initialized_ = true;
 
   return Status::OK();
@@ -320,6 +281,7 @@ CertSigner::CertSigner(const Cert* ca_cert,
 }
 
 Status CertSigner::Sign(const CertSignRequest& req, Cert* ret) const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   InitializeOpenSSL();
   CHECK(ret);
 
@@ -341,6 +303,7 @@ Status CertSigner::Sign(const CertSignRequest& req, Cert* ret) const {
 // This is modeled after code in copy_extensions() function from
 // $OPENSSL_ROOT/apps/apps.c with OpenSSL 1.0.2.
 Status CertSigner::CopyExtensions(X509_REQ* req, X509* x) {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(req);
   CHECK(x);
   STACK_OF(X509_EXTENSION)* exts = X509_REQ_get_extensions(req);
@@ -366,6 +329,7 @@ Status CertSigner::CopyExtensions(X509_REQ* req, X509* x) {
 }
 
 Status CertSigner::FillCertTemplateFromRequest(X509_REQ* req, X509* tmpl) {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(req);
   if (!req->req_info ||
       !req->req_info->pubkey ||
@@ -374,15 +338,15 @@ Status CertSigner::FillCertTemplateFromRequest(X509_REQ* req, X509* tmpl) {
     return Status::RuntimeError("corrupted CSR: no public key");
   }
   auto pub_key = ssl_make_unique(X509_REQ_get_pubkey(req));
-  if (!pub_key) {
-    return Status::RuntimeError("error unpacking public key from CSR");
-  }
+  OPENSSL_RET_IF_NULL(pub_key, "error unpacking public key from CSR");
   const int rc = X509_REQ_verify(req, pub_key.get());
   if (rc < 0) {
-    return Status::RuntimeError("CSR signature verification error");
+    return Status::RuntimeError("CSR signature verification error",
+                                GetOpenSSLErrors());
   }
   if (rc == 0) {
-    return Status::RuntimeError("CSR signature mismatch");
+    return Status::RuntimeError("CSR signature mismatch",
+                                GetOpenSSLErrors());
   }
   OPENSSL_RET_NOT_OK(X509_set_subject_name(tmpl, X509_REQ_get_subject_name(req)),
       "error setting cert subject name");
@@ -398,6 +362,7 @@ Status CertSigner::DigestSign(const EVP_MD* md, EVP_PKEY* pkey, X509* x) {
 }
 
 Status CertSigner::GenerateSerial(c_unique_ptr<ASN1_INTEGER>* ret) {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   auto btmp = ssl_make_unique(BN_new());
   OPENSSL_RET_NOT_OK(BN_pseudo_rand(btmp.get(), 64, 0, 0),
       "error generating random number");
@@ -412,6 +377,7 @@ Status CertSigner::GenerateSerial(c_unique_ptr<ASN1_INTEGER>* ret) {
 
 Status CertSigner::DoSign(const EVP_MD* digest, int32_t exp_seconds,
                           X509* ret) const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(ret);
 
   // Version 3 (v3) of X509 certificates. The integer value is one less

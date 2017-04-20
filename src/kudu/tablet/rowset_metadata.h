@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include <boost/container/flat_map.hpp>
+
 #include "kudu/common/schema.h"
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/fs_manager.h"
@@ -63,7 +65,9 @@ class TabletMetadata;
 //
 class RowSetMetadata {
  public:
-  typedef std::map<ColumnId, BlockId> ColumnIdToBlockIdMap;
+  // We use a flat_map to save memory, since there are lots of these metadata
+  // objects.
+  typedef boost::container::flat_map<ColumnId, BlockId> ColumnIdToBlockIdMap;
 
   // Create a new RowSetMetadata
   static Status CreateNew(TabletMetadata* tablet_metadata,
@@ -97,7 +101,7 @@ class RowSetMetadata {
     adhoc_index_block_ = block_id;
   }
 
-  void SetColumnDataBlocks(const ColumnIdToBlockIdMap& blocks_by_col_id);
+  void SetColumnDataBlocks(const std::map<ColumnId, BlockId>& blocks_by_col_id);
 
   Status CommitRedoDeltaDataBlock(int64_t dms_id, const BlockId& block_id);
 
@@ -230,6 +234,9 @@ class RowSetMetadataUpdate {
   RowSetMetadataUpdate& ReplaceRedoDeltaBlocks(const std::vector<BlockId>& to_remove,
                                                const std::vector<BlockId>& to_add);
 
+  // Remove the specified undo delta blocks.
+  RowSetMetadataUpdate& RemoveUndoDeltaBlocks(const std::vector<BlockId>& to_remove);
+
   // Replace the CFile for the given column ID.
   RowSetMetadataUpdate& ReplaceColumnId(ColumnId col_id, const BlockId& block_id);
 
@@ -251,6 +258,8 @@ class RowSetMetadataUpdate {
     std::vector<BlockId> to_add;
   };
   std::vector<ReplaceDeltaBlocks> replace_redo_blocks_;
+
+  std::vector<BlockId> remove_undo_blocks_;
   BlockId new_undo_block_;
 
   DISALLOW_COPY_AND_ASSIGN(RowSetMetadataUpdate);

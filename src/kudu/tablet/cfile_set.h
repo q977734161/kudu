@@ -17,10 +17,10 @@
 #ifndef KUDU_TABLET_LAYER_BASEDATA_H
 #define KUDU_TABLET_LAYER_BASEDATA_H
 
+#include <boost/container/flat_map.hpp>
 #include <gtest/gtest_prod.h>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "kudu/cfile/bloomfile.h"
@@ -119,13 +119,15 @@ class CFileSet : public std::enable_shared_from_this<CFileSet> {
   std::string max_encoded_key_;
 
   // Map of column ID to reader. These are lazily initialized as needed.
-  typedef std::unordered_map<int, std::shared_ptr<CFileReader> > ReaderMap;
+  // We use flat_map here since it's the most memory-compact while
+  // still having good performance for small maps.
+  typedef boost::container::flat_map<int, std::unique_ptr<CFileReader>> ReaderMap;
   ReaderMap readers_by_col_id_;
 
   // A file reader for an ad-hoc index, i.e. an index that sits in its own file
   // and is not embedded with the column's data blocks. This is used when the
   // index pertains to more than one column, as in the case of composite keys.
-  gscoped_ptr<CFileReader> ad_hoc_idx_reader_;
+  std::unique_ptr<CFileReader> ad_hoc_idx_reader_;
   gscoped_ptr<BloomFileReader> bloom_reader_;
 };
 
@@ -205,7 +207,7 @@ class CFileSet::Iterator : public ColumnwiseIterator {
 
   // Iterator for the key column in the underlying data.
   gscoped_ptr<CFileIterator> key_iter_;
-  std::vector<ColumnIterator*> col_iters_;
+  std::vector<std::unique_ptr<ColumnIterator>> col_iters_;
 
   bool initted_;
 

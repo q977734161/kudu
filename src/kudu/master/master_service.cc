@@ -18,20 +18,22 @@
 #include "kudu/master/master_service.h"
 
 #include <gflags/gflags.h>
+#include <google/protobuf/message.h>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "kudu/common/wire_protocol.h"
-#include "kudu/master/authn_token_manager.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master_cert_authority.h"
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
+#include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/rpc_context.h"
-#include "kudu/rpc/user_credentials.h"
 #include "kudu/server/webserver.h"
+#include "kudu/security/token_signer.h"
+#include "kudu/security/token_verifier.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/pb_util.h"
 
@@ -49,14 +51,16 @@ TAG_FLAG(master_support_connect_to_master_rpc, unsafe);
 TAG_FLAG(master_support_connect_to_master_rpc, hidden);
 
 using kudu::security::SignedTokenPB;
+using google::protobuf::Message;
+using std::string;
+using std::vector;
+using std::shared_ptr;
 
 namespace kudu {
 namespace master {
 
-using consensus::RaftPeerPB;
-using std::string;
-using std::vector;
-using std::shared_ptr;
+using server::ServerBase;
+using security::SignedTokenPB;
 using strings::Substitute;
 
 namespace {
@@ -79,8 +83,30 @@ MasterServiceImpl::MasterServiceImpl(Master* server)
     server_(server) {
 }
 
-void MasterServiceImpl::Ping(const PingRequestPB* req,
-                             PingResponsePB* resp,
+bool MasterServiceImpl::AuthorizeClient(const Message* /*req*/,
+                                        Message* /*resp*/,
+                                        rpc::RpcContext* context) {
+  return server_->Authorize(context, ServerBase::SUPER_USER | ServerBase::USER);
+}
+
+bool MasterServiceImpl::AuthorizeService(const Message* /*req*/,
+                                         Message* /*resp*/,
+                                         rpc::RpcContext* context) {
+  // We don't allow superusers to pretend to be tablet servers -- there are no
+  // operator tools that do anything like this and since we sign requests for
+  // tablet servers, we should be extra tight here.
+  return server_->Authorize(context, ServerBase::SERVICE_USER);
+}
+
+bool MasterServiceImpl::AuthorizeClientOrService(const Message* /*req*/,
+                                                 Message* /*resp*/,
+                                                 rpc::RpcContext* context) {
+  return server_->Authorize(context, ServerBase::SUPER_USER | ServerBase::USER |
+                            ServerBase::SERVICE_USER);
+}
+
+void MasterServiceImpl::Ping(const PingRequestPB* /*req*/,
+                             PingResponsePB* /*resp*/,
                              rpc::RpcContext* rpc) {
   rpc->RespondSuccess();
 }
@@ -154,7 +180,8 @@ void MasterServiceImpl::TSHeartbeat(const TSHeartbeatRequestPB* req,
   // 6. Only leaders sign CSR from tablet servers (if present).
   if (is_leader_master && req->has_csr_der()) {
     string cert;
-    Status s = server_->cert_authority()->SignServerCSR(req->csr_der(), &cert);
+    Status s = server_->cert_authority()->SignServerCSR(
+        req->csr_der(), rpc->remote_user(), &cert);
     if (!s.ok()) {
       rpc->RespondFailure(s.CloneAndPrepend("invalid CSR"));
       return;
@@ -164,7 +191,15 @@ void MasterServiceImpl::TSHeartbeat(const TSHeartbeatRequestPB* req,
     resp->add_ca_cert_der(server_->cert_authority()->ca_cert_der());
   }
 
-  // TODO(aserbin): 7. Send any active CA certs which the TS doesn't have.
+  // 7. Only leaders send public parts of non-expired TSK
+  // which the TS doesn't have.
+  if (is_leader_master && req->has_latest_tsk_seq_num()) {
+    auto tsk_public_keys = server_->token_signer()->verifier().ExportKeys(
+        req->latest_tsk_seq_num());
+    for (auto& key : tsk_public_keys) {
+      resp->add_tsks()->Swap(&key);
+    }
+  }
 
   rpc->RespondSuccess();
 }
@@ -364,7 +399,7 @@ void MasterServiceImpl::ConnectToMaster(const ConnectToMasterRequestPB* /*req*/,
   resp->set_role(role);
 
   if (l.leader_status().ok()) {
-    // TODO(PKI): it seems there is some window when 'role' is LEADER but
+    // TODO(KUDU-1924): it seems there is some window when 'role' is LEADER but
     // in fact we aren't done initializing (and we don't have a CA cert).
     // In that case, if we respond with the 'LEADER' role to a client, but
     // don't pass back the CA cert, then the client won't be able to trust
@@ -372,22 +407,21 @@ void MasterServiceImpl::ConnectToMaster(const ConnectToMasterRequestPB* /*req*/,
     // exactly as the leader is changing.
     resp->add_ca_cert_der(server_->cert_authority()->ca_cert_der());
 
-    // Issue an authentication token for the caller.
-    // TODO(PKI): we should probably only issue a token if the client is
-    // authenticated by kerberos, and not by another token. Otherwise we're
-    // essentially allowing unlimited renewal, which is probably not what
-    // we want.
-    SignedTokenPB authn_token;
-    Status s = server_->authn_token_manager()->GenerateToken(
-        rpc->user_credentials().real_user(),
-        &authn_token);
-    if (!s.ok()) {
-      KLOG_EVERY_N_SECS(WARNING, 1)
-          << "Unable to generate signed token for " << rpc->requestor_string()
-          << ": " << s.ToString();
-    } else {
-      // TODO(todd): this might be a good spot for some auditing code?
-      resp->mutable_authn_token()->Swap(&authn_token);
+    // Issue an authentication token for the caller, unless they are
+    // already using a token to authenticate.
+    if (rpc->remote_user().authenticated_by() != rpc::RemoteUser::AUTHN_TOKEN) {
+      SignedTokenPB authn_token;
+      Status s = server_->token_signer()->GenerateAuthnToken(
+          rpc->remote_user().username(),
+          &authn_token);
+      if (!s.ok()) {
+        KLOG_EVERY_N_SECS(WARNING, 1)
+            << "Unable to generate signed token for " << rpc->requestor_string()
+            << ": " << s.ToString();
+      } else {
+        // TODO(todd): this might be a good spot for some auditing code?
+        resp->mutable_authn_token()->Swap(&authn_token);
+      }
     }
   }
   rpc->RespondSuccess();

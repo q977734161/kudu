@@ -64,14 +64,15 @@ DEFINE_string(webserver_private_key_password_cmd, "", "A Unix command whose outp
     "password-protected, this command will not be invoked. The output of the command "
     "will be truncated to 1024 bytes, and then all trailing whitespace will be trimmed "
     "before it is used to decrypt the private key");
-
+TAG_FLAG(webserver_certificate_file, stable);
+TAG_FLAG(webserver_private_key_file, stable);
+TAG_FLAG(webserver_private_key_password_cmd, stable);
 
 DEFINE_string(webserver_authentication_domain, "",
     "Domain used for debug webserver authentication");
 DEFINE_string(webserver_password_file, "",
     "(Optional) Location of .htpasswd file containing user names and hashed passwords for"
     " debug webserver authentication");
-
 
 DEFINE_int32(webserver_num_worker_threads, 50,
              "Maximum number of threads to start for handling web server requests");
@@ -82,6 +83,26 @@ DEFINE_int32(webserver_port, 0,
 TAG_FLAG(webserver_port, stable);
 
 namespace kudu {
+
+static bool ValidateTlsFlags(const char* /*flag_name*/, const string& /*flag_value*/) {
+  bool has_cert = !FLAGS_webserver_certificate_file.empty();
+  bool has_key = !FLAGS_webserver_private_key_file.empty();
+  bool has_passwd = !FLAGS_webserver_private_key_password_cmd.empty();
+
+  if (has_key != has_cert) {
+    LOG(ERROR) << "--webserver_certificate_file and --webserver_private_key_file "
+                  "must be set as a group";
+    return false;
+  }
+  if (has_passwd && !has_key) {
+    LOG(ERROR) << "--webserver_private_key_password_cmd may not be set without "
+                  "--webserver_private_key_file";
+    return false;
+  }
+
+  return true;
+}
+DEFINE_validator(webserver_private_key_file, &ValidateTlsFlags);
 
 // Returns KUDU_HOME if set, otherwise we won't serve any static files.
 static string GetDefaultDocumentRoot() {

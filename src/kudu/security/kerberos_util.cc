@@ -14,37 +14,23 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#pragma once
 
-#include <memory>
-#include <string>
+#include "kudu/security/kerberos_util.h"
+#include "kudu/gutil/strings/split.h"
 
-#include "kudu/gutil/macros.h"
+#include <array>
+#include <utility>
 
 namespace kudu {
-class Status;
-
 namespace security {
-class SignedTokenPB;
-class TokenSigner;
+
+std::array<StringPiece, 3> SplitKerberosPrincipal(StringPiece principal) {
+
+  std::pair<StringPiece, StringPiece> user_realm = strings::Split(principal, "@");
+  std::pair<StringPiece, StringPiece> princ_host = strings::Split(user_realm.first, "/");
+  return {{princ_host.first, princ_host.second, user_realm.second}};
+}
+
+
 } // namespace security
-
-namespace master {
-
-class AuthnTokenManager {
- public:
-  AuthnTokenManager();
-  ~AuthnTokenManager();
-
-  Status Init(int64_t next_tsk_seq_num);
-
-  Status GenerateToken(std::string username,
-                       security::SignedTokenPB* signed_token);
-
- private:
-  std::unique_ptr<security::TokenSigner> signer_;
-  DISALLOW_COPY_AND_ASSIGN(AuthnTokenManager);
-};
-
-} // namespace master
 } // namespace kudu

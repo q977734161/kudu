@@ -19,7 +19,6 @@
 
 #include <string.h>
 
-#include <algorithm>
 #include <map>
 #include <memory>
 #include <set>
@@ -38,6 +37,7 @@
 #include "kudu/gutil/strings/util.h"
 #include "kudu/rpc/blocking_ops.h"
 #include "kudu/rpc/constants.h"
+#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/sasl_helper.h"
@@ -105,12 +105,15 @@ static Status StatusFromRpcError(const ErrorStatusPB& error) {
 
 ClientNegotiation::ClientNegotiation(unique_ptr<Socket> socket,
                                      const security::TlsContext* tls_context,
-                                     const boost::optional<security::SignedTokenPB>& authn_token)
+                                     const boost::optional<security::SignedTokenPB>& authn_token,
+                                     RpcEncryption encryption)
     : socket_(std::move(socket)),
       helper_(SaslHelper::CLIENT),
       tls_context_(tls_context),
+      encryption_(encryption),
       tls_negotiated_(false),
       authn_token_(authn_token),
+      psecret_(nullptr, std::free),
       negotiated_authn_(AuthenticationType::INVALID),
       negotiated_mech_(SaslMechanism::INVALID),
       deadline_(MonoTime::Max()) {
@@ -164,11 +167,13 @@ Status ClientNegotiation::Negotiate() {
     NegotiatePB response;
     RETURN_NOT_OK(RecvNegotiatePB(&response, &recv_buf));
     RETURN_NOT_OK(HandleNegotiate(response));
+    TRACE("Negotiated authn=$0", AuthenticationTypeToString(negotiated_authn_));
   }
 
   // Step 3: if both ends support TLS, do a TLS handshake.
-  // TODO(PKI): allow the client to require TLS.
-  if (ContainsKey(server_features_, TLS)) {
+  // TODO(KUDU-1921): allow the client to require TLS.
+  if (encryption_ != RpcEncryption::DISABLED &&
+      ContainsKey(server_features_, TLS)) {
     RETURN_NOT_OK(tls_context_->InitiateHandshake(security::TlsHandshakeType::CLIENT,
                                                   &tls_handshake_));
 
@@ -265,8 +270,8 @@ Status ClientNegotiation::SendConnectionHeader() {
 Status ClientNegotiation::InitSaslClient() {
   RETURN_NOT_OK(SaslInit());
 
-  // TODO(unknown): Support security flags.
-  unsigned secflags = 0;
+  // TODO(KUDU-1922): consider setting SASL_SUCCESS_DATA
+  unsigned flags = 0;
 
   sasl_conn_t* sasl_conn = nullptr;
   RETURN_NOT_OK_PREPEND(WrapSaslCall(nullptr /* no conn */, [&]() {
@@ -276,7 +281,7 @@ Status ClientNegotiation::InitSaslClient() {
           nullptr,                      // Local and remote IP address strings. (we don't use
           nullptr,                      // any mechanisms which require this info.)
           &callbacks_[0],               // Connection-specific callbacks.
-          secflags,                     // Security flags.
+          flags,
           &sasl_conn);
     }), "Unable to create new SASL client");
   sasl_conn_.reset(sasl_conn);
@@ -289,10 +294,14 @@ Status ClientNegotiation::SendNegotiate() {
 
   // Advertise our supported features.
   client_features_ = kSupportedClientRpcFeatureFlags;
-  // If the remote peer is local, then we allow using TLS for authentication
-  // without encryption or integrity.
-  if (socket_->IsLoopbackConnection() && !FLAGS_rpc_encrypt_loopback_connections) {
-    client_features_.insert(TLS_AUTHENTICATION_ONLY);
+
+  if (encryption_ != RpcEncryption::DISABLED) {
+    client_features_.insert(TLS);
+    // If the remote peer is local, then we allow using TLS for authentication
+    // without encryption or integrity.
+    if (socket_->IsLoopbackConnection() && !FLAGS_rpc_encrypt_loopback_connections) {
+      client_features_.insert(TLS_AUTHENTICATION_ONLY);
+    }
   }
 
   for (RpcFeatureFlag feature : client_features_) {
@@ -302,11 +311,13 @@ Status ClientNegotiation::SendNegotiate() {
   if (!helper_.EnabledMechs().empty()) {
     msg.add_authn_types()->mutable_sasl();
   }
-  if (tls_context_->has_signed_cert()) {
+  if (tls_context_->has_signed_cert() && !tls_context_->is_external_cert()) {
+    // We only provide authenticated TLS if the certificates are generated
+    // by the internal CA.
     msg.add_authn_types()->mutable_certificate();
   }
   if (authn_token_ && tls_context_->has_trusted_cert()) {
-    // TODO(PKI): check that the authn token is not expired. Can this be done
+    // TODO(KUDU-1924): check that the authn token is not expired. Can this be done
     // reliably on clients?
     msg.add_authn_types()->mutable_token();
   }
@@ -336,6 +347,11 @@ Status ClientNegotiation::HandleNegotiate(const NegotiatePB& response) {
     }
   }
 
+  if (encryption_ == RpcEncryption::REQUIRED &&
+      !ContainsKey(server_features_, RpcFeatureFlag::TLS)) {
+    return Status::NotAuthorized("server does not support required TLS encryption");
+  }
+
   // Get the authentication type which the server would like to use.
   DCHECK_LE(response.authn_types().size(), 1);
   if (response.authn_types().empty()) {
@@ -349,6 +365,9 @@ Status ClientNegotiation::HandleNegotiate(const NegotiatePB& response) {
         negotiated_authn_ = AuthenticationType::SASL;
         break;
       case AuthenticationTypePB::kToken:
+        // TODO(todd): we should also be checking tls_context_->has_trusted_cert()
+        // here to match the original logic we used to advertise TOKEN support,
+        // or perhaps just check explicitly whether we advertised TOKEN.
         if (!authn_token_) {
           return Status::RuntimeError(
               "server chose token authentication, but client has no token");
@@ -410,7 +429,7 @@ Status ClientNegotiation::HandleNegotiate(const NegotiatePB& response) {
     return Status::NotAuthorized(msg);
   }
 
-  // TODO(PKI): allow the client to require authentication.
+  // TODO(KUDU-1921): allow the client to require authentication.
   if (ContainsKey(common_mechs, SaslMechanism::GSSAPI)) {
     negotiated_mech_ = SaslMechanism::GSSAPI;
   } else {
@@ -468,24 +487,23 @@ Status ClientNegotiation::HandleTlsHandshake(const NegotiatePB& response) {
 
 Status ClientNegotiation::AuthenticateBySasl(faststring* recv_buf) {
   RETURN_NOT_OK(InitSaslClient());
-  RETURN_NOT_OK(SendSaslInitiate());
-  NegotiatePB response;
-  while (true) {
-    RETURN_NOT_OK(RecvNegotiatePB(&response, recv_buf));
-    Status s;
-    switch (response.step()) {
-      // SASL_CHALLENGE: Server sent us a follow-up to a SASL_INITIATE or SASL_RESPONSE request.
-      case NegotiatePB::SASL_CHALLENGE:
-        RETURN_NOT_OK(HandleSaslChallenge(response));
-        break;
-      // SASL_SUCCESS: Server has accepted our authentication request. Negotiation successful.
-      case NegotiatePB::SASL_SUCCESS:
-        return HandleSaslSuccess(response);
-      default:
-        return Status::NotAuthorized("expected SASL_CHALLENGE or SASL_SUCCESS step",
-                                     NegotiatePB::NegotiateStep_Name(response.step()));
-    }
+  Status s = SendSaslInitiate();
+
+  // HandleSasl[Initiate, Challenge] return incomplete if an additional
+  // challenge step is required, or OK if a SASL_SUCCESS message is expected.
+  while (s.IsIncomplete()) {
+    NegotiatePB challenge;
+    RETURN_NOT_OK(RecvNegotiatePB(&challenge, recv_buf));
+    s = HandleSaslChallenge(challenge);
   }
+
+  // Propagate failure from SendSaslInitiate or HandleSaslChallenge.
+  RETURN_NOT_OK(s);
+
+  // Server challenges are over; we now expect the success message.
+  NegotiatePB success;
+  RETURN_NOT_OK(RecvNegotiatePB(&success, recv_buf));
+  return HandleSaslSuccess(success);
 }
 
 Status ClientNegotiation::AuthenticateByToken(faststring* recv_buf) {
@@ -511,7 +529,7 @@ Status ClientNegotiation::AuthenticateByToken(faststring* recv_buf) {
 }
 
 Status ClientNegotiation::SendSaslInitiate() {
-  TRACE("Initiating SASL $0 handshake", negotiated_mech_);
+  TRACE("Initiating SASL $0 handshake", SaslMechanism::name_of(negotiated_mech_));
 
   // At this point we've already chosen the SASL mechanism to use
   // (negotiated_mech_), but we need to let the SASL library know. SASL likes to
@@ -537,7 +555,7 @@ Status ClientNegotiation::SendSaslInitiate() {
    *  SASL_INTERACT -- user interaction needed to fill in prompt_need list
    */
   TRACE("Calling sasl_client_start()");
-  Status s = WrapSaslCall(sasl_conn_.get(), [&]() {
+  const Status s = WrapSaslCall(sasl_conn_.get(), [&]() {
       return sasl_client_start(
           sasl_conn_.get(),                         // The SASL connection context created by init()
           SaslMechanism::name_of(negotiated_mech_), // The list of mechanisms to negotiate.
@@ -554,10 +572,10 @@ Status ClientNegotiation::SendSaslInitiate() {
   // Check that the SASL library is using the mechanism that we picked.
   DCHECK_EQ(SaslMechanism::value_of(negotiated_mech), negotiated_mech_);
 
-  // If we are speaking TLS and the negotiated mechanism is GSSAPI (Kerberos),
-  // configure SASL to use integrity protection so that the channel bindings
-  // can be verified.
-  if (tls_negotiated_ && negotiated_mech_ == SaslMechanism::GSSAPI) {
+  // If the negotiated mechanism is GSSAPI (Kerberos), configure SASL to use
+  // integrity protection so that the channel bindings and nonce can be
+  // verified.
+  if (negotiated_mech_ == SaslMechanism::GSSAPI) {
     RETURN_NOT_OK(EnableIntegrityProtection(sasl_conn_.get()));
   }
 
@@ -565,7 +583,8 @@ Status ClientNegotiation::SendSaslInitiate() {
   msg.set_step(NegotiatePB::SASL_INITIATE);
   msg.mutable_token()->assign(init_msg, init_msg_len);
   msg.add_sasl_mechanisms()->set_mechanism(negotiated_mech);
-  return SendNegotiatePB(msg);
+  RETURN_NOT_OK(SendNegotiatePB(msg));
+  return s;
 }
 
 Status ClientNegotiation::SendSaslResponse(const char* resp_msg, unsigned resp_msg_len) {
@@ -576,6 +595,10 @@ Status ClientNegotiation::SendSaslResponse(const char* resp_msg, unsigned resp_m
 }
 
 Status ClientNegotiation::HandleSaslChallenge(const NegotiatePB& response) {
+  if (PREDICT_FALSE(response.step() != NegotiatePB::SASL_CHALLENGE)) {
+    return Status::NotAuthorized("expected SASL_CHALLENGE step",
+                                 NegotiatePB::NegotiateStep_Name(response.step()));
+  }
   TRACE("Received SASL_CHALLENGE response from server");
   if (PREDICT_FALSE(!response.has_token())) {
     return Status::NotAuthorized("no token in SASL_CHALLENGE response from server");
@@ -583,45 +606,57 @@ Status ClientNegotiation::HandleSaslChallenge(const NegotiatePB& response) {
 
   const char* out = nullptr;
   unsigned out_len = 0;
-  Status s = DoSaslStep(response.token(), &out, &out_len);
+  const Status s = DoSaslStep(response.token(), &out, &out_len);
   if (PREDICT_FALSE(!s.IsIncomplete() && !s.ok())) {
     return s;
   }
 
-  return SendSaslResponse(out, out_len);
+  RETURN_NOT_OK(SendSaslResponse(out, out_len));
+  return s;
 }
 
 Status ClientNegotiation::HandleSaslSuccess(const NegotiatePB& response) {
+  if (PREDICT_FALSE(response.step() != NegotiatePB::SASL_SUCCESS)) {
+    return Status::NotAuthorized("expected SASL_SUCCESS step",
+                                 NegotiatePB::NegotiateStep_Name(response.step()));
+  }
   TRACE("Received SASL_SUCCESS response from server");
 
-  if (tls_negotiated_ &&
-      negotiated_authn_ == AuthenticationType::SASL &&
-      negotiated_mech_ == SaslMechanism::GSSAPI) {
-    // Check the channel bindings provided by the server against the expected
-    // channel bindings.
-    security::Cert cert;
-    RETURN_NOT_OK(tls_handshake_.GetRemoteCert(&cert));
-
-    string expected_channel_bindings;
-    RETURN_NOT_OK_PREPEND(cert.GetServerEndPointChannelBindings(&expected_channel_bindings),
-                          "failed to generate channel bindings");
-
-    if (!response.has_channel_bindings()) {
-      return Status::NotAuthorized("no channel bindings provided by server");
+  if (negotiated_mech_ == SaslMechanism::GSSAPI) {
+    if (response.has_nonce()) {
+      // Grab the nonce from the server, if it has sent one. We'll send it back
+      // later with SASL integrity protection as part of the connection context.
+      nonce_ = response.nonce();
     }
 
-    string recieved_channel_bindings;
-    RETURN_NOT_OK_PREPEND(SaslDecode(response.channel_bindings(), &recieved_channel_bindings),
-                          "failed to decode channel bindings");
+    if (tls_negotiated_) {
+      // Check the channel bindings provided by the server against the expected channel bindings.
+      if (!response.has_channel_bindings()) {
+        return Status::NotAuthorized("no channel bindings provided by server");
+      }
 
-    if (expected_channel_bindings != recieved_channel_bindings) {
-      Sockaddr addr;
-      ignore_result(socket_->GetPeerAddress(&addr));
+      security::Cert cert;
+      RETURN_NOT_OK(tls_handshake_.GetRemoteCert(&cert));
 
-      LOG(WARNING) << "Recieved unexpected channel bindings from server "
-                   << addr.ToString()
-                   << ", this could indicate an active network man-in-the-middle";
-      return Status::NotAuthorized("channel bindings do not match");
+      string expected_channel_bindings;
+      RETURN_NOT_OK_PREPEND(cert.GetServerEndPointChannelBindings(&expected_channel_bindings),
+                            "failed to generate channel bindings");
+
+      string received_channel_bindings;
+      RETURN_NOT_OK_PREPEND(SaslDecode(sasl_conn_.get(),
+                                       response.channel_bindings(),
+                                       &received_channel_bindings),
+                            "failed to decode channel bindings");
+
+      if (expected_channel_bindings != received_channel_bindings) {
+        Sockaddr addr;
+        ignore_result(socket_->GetPeerAddress(&addr));
+
+        LOG(WARNING) << "Received invalid channel bindings from server "
+                    << addr.ToString()
+                    << ", this could indicate an active network man-in-the-middle";
+        return Status::NotAuthorized("channel bindings do not match");
+      }
     }
   }
 
@@ -636,27 +671,6 @@ Status ClientNegotiation::DoSaslStep(const string& in, const char** out, unsigne
   });
 }
 
-Status ClientNegotiation::SaslDecode(const string& encoded, string* plaintext) {
-  size_t offset = 0;
-  const char* out;
-  unsigned out_len;
-
-  // The SASL library can only decode up to a maximum amount at a time, so we
-  // have to call decode multiple times if our input is larger than this max.
-  while (offset < encoded.size()) {
-    size_t len = std::min(kSaslMaxOutBufLen, encoded.size() - offset);
-
-    RETURN_NOT_OK(WrapSaslCall(sasl_conn_.get(), [&]() {
-        return sasl_decode(sasl_conn_.get(), encoded.data() + offset, len, &out, &out_len);
-    }));
-
-    plaintext->append(out, out_len);
-    offset += len;
-  }
-
-  return Status::OK();
-}
-
 Status ClientNegotiation::SendConnectionContext() {
   TRACE("Sending connection context");
   RequestHeader header;
@@ -667,6 +681,12 @@ Status ClientNegotiation::SendConnectionContext() {
   // this and use the SASL-provided username instead.
   conn_context.mutable_deprecated_user_info()->set_real_user(
       plain_auth_user_.empty() ? "cpp-client" : plain_auth_user_);
+
+  if (nonce_) {
+    // Reply with the SASL-protected nonce. We only set the nonce when using SASL GSSAPI.
+    RETURN_NOT_OK(SaslEncode(sasl_conn_.get(), *nonce_, conn_context.mutable_encoded_nonce()));
+  }
+
   return SendFramedMessageBlocking(socket(), header, conn_context, deadline_);
 }
 

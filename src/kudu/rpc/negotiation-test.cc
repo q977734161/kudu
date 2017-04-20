@@ -32,6 +32,7 @@
 
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
@@ -45,11 +46,14 @@
 #include "kudu/security/tls_context.h"
 #include "kudu/security/tls_socket.h"
 #include "kudu/security/token_signer.h"
+#include "kudu/security/token_signing_key.h"
 #include "kudu/security/token_verifier.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
 #include "kudu/util/subprocess.h"
+#include "kudu/util/trace.h"
+#include "kudu/util/user.h"
 
 // HACK: MIT Kerberos doesn't have any way of determining its version number,
 // but the error messages in krb5-1.10 and earlier are broken due to
@@ -66,7 +70,7 @@ DEFINE_bool(is_test_child, false,
             "Used by tests which require clean processes. "
             "See TestDisableInit.");
 DECLARE_bool(rpc_encrypt_loopback_connections);
-DECLARE_int32(server_rsa_key_length_bits);
+DECLARE_bool(rpc_trace_negotiation);
 
 using std::string;
 using std::thread;
@@ -78,6 +82,7 @@ using kudu::security::PrivateKey;
 using kudu::security::SignedTokenPB;
 using kudu::security::TlsContext;
 using kudu::security::TokenSigner;
+using kudu::security::TokenSigningPrivateKey;
 using kudu::security::TokenVerifier;
 
 namespace kudu {
@@ -92,13 +97,22 @@ struct EndpointConfig {
   // For the client, whether the client has the token.
   // For the server, whether the server has the TSK.
   bool token;
+  RpcEncryption encryption;
 };
 std::ostream& operator<<(std::ostream& o, EndpointConfig config) {
   auto bool_string = [] (bool b) { return b ? "true" : "false"; };
   o << "{pki: " << config.pki
     << ", sasl-mechs: [" << JoinMapped(config.sasl_mechs, SaslMechanism::name_of, ", ")
     << "], token: " << bool_string(config.token)
-    << "}";
+    << ", encryption: ";
+
+  switch (config.encryption) {
+    case RpcEncryption::DISABLED: o << "DISABLED"; break;
+    case RpcEncryption::OPTIONAL: o << "OPTIONAL"; break;
+    case RpcEncryption::REQUIRED: o << "REQUIRED"; break;
+  }
+
+  o << "}";
   return o;
 }
 
@@ -160,9 +174,15 @@ TEST_P(TestNegotiation, TestNegotiation) {
   FLAGS_rpc_encrypt_loopback_connections = desc.rpc_encrypt_loopback;
 
   // Generate an optional client token and server token verifier.
-  TokenSigner token_signer(1);
+  TokenSigner token_signer(60, 20, std::make_shared<TokenVerifier>());
+  {
+    unique_ptr<TokenSigningPrivateKey> key;
+    ASSERT_OK(token_signer.CheckNeedKey(&key));
+    // No keys are available yet, so should be able to add.
+    ASSERT_NE(nullptr, key.get());
+    ASSERT_OK(token_signer.AddKey(std::move(key)));
+  }
   TokenVerifier token_verifier;
-  ASSERT_OK(token_signer.RotateSigningKey());
   boost::optional<SignedTokenPB> authn_token;
   if (desc.client.token) {
     authn_token = SignedTokenPB();
@@ -173,7 +193,7 @@ TEST_P(TestNegotiation, TestNegotiation) {
     ASSERT_OK(token_signer.SignToken(&*authn_token));
   }
   if (desc.server.token) {
-    ASSERT_OK(token_verifier.ImportPublicKeys(token_signer.GetTokenSigningPublicKeys(0)));
+    ASSERT_OK(token_verifier.ImportKeys(token_signer.verifier().ExportKeys()));
   }
 
   // Create the listening socket, client socket, and server socket.
@@ -194,10 +214,12 @@ TEST_P(TestNegotiation, TestNegotiation) {
   // Create and configure the client and server negotiation instances.
   ClientNegotiation client_negotiation(std::move(client_socket),
                                        &client_tls_context,
-                                       authn_token);
+                                       authn_token,
+                                       desc.client.encryption);
   ServerNegotiation server_negotiation(std::move(server_socket),
                                        &server_tls_context,
-                                       &token_verifier);
+                                       &token_verifier,
+                                       desc.server.encryption);
 
   // Set client and server SASL mechanisms.
   MiniKdc kdc;
@@ -253,9 +275,20 @@ TEST_P(TestNegotiation, TestNegotiation) {
       client_negotiation.socket()->Close();
   });
   thread server_thread([&] () {
+      scoped_refptr<Trace> t(new Trace());
+      ADOPT_TRACE(t.get());
       server_status = server_negotiation.Negotiate();
       // Close the socket so that the client will not block forever on error.
       server_negotiation.socket()->Close();
+
+      if (FLAGS_rpc_trace_negotiation || !server_status.ok()) {
+        string msg = Trace::CurrentTrace()->DumpToString();
+        if (!server_status.ok()) {
+          LOG(WARNING) << "Failed RPC negotiation. Trace:\n" << msg;
+        } else {
+          LOG(INFO) << "RPC negotiation tracing enabled. Trace:\n" << msg;
+        }
+      }
   });
   client_thread.join();
   server_thread.join();
@@ -283,29 +316,34 @@ TEST_P(TestNegotiation, TestNegotiation) {
     EXPECT_EQ(desc.rpc_encrypt_loopback, server_tls_socket);
 
     // Check that the expected user subject is authenticated.
-    // TODO(PKI): reenable this once subjects are handled correctly among authn types.
-    /*
+    RemoteUser remote_user = server_negotiation.take_authenticated_user();
     switch (server_negotiation.negotiated_authn()) {
       case AuthenticationType::SASL:
         switch (server_negotiation.negotiated_mechanism()) {
           case SaslMechanism::PLAIN:
-            EXPECT_EQ("client-plain", server_negotiation.authenticated_user());
+            EXPECT_EQ("client-plain", remote_user.username());
             break;
           case SaslMechanism::GSSAPI:
-            EXPECT_EQ("client-gssapi", server_negotiation.authenticated_user());
+            EXPECT_EQ("client-gssapi", remote_user.username());
+            EXPECT_EQ("client-gssapi@KRBTEST.COM", remote_user.principal().value_or(""));
             break;
           case SaslMechanism::INVALID: LOG(FATAL) << "invalid mechanism negotiated";
         }
         break;
-      case AuthenticationType::CERTIFICATE:
-          EXPECT_EQ("client-certificate", server_negotiation.authenticated_user());
-          break;
+      case AuthenticationType::CERTIFICATE: {
+        // We expect the cert to be using the local username, because it hasn't
+        // logged in from any Keytab.
+        string expected;
+        CHECK_OK(GetLoggedInUser(&expected));
+        EXPECT_EQ(expected, remote_user.username());
+        EXPECT_FALSE(remote_user.principal());
+        break;
+      }
       case AuthenticationType::TOKEN:
-          EXPECT_EQ("client-token", server_negotiation.authenticated_user());
-          break;
+        EXPECT_EQ("client-token", remote_user.username());
+        break;
       case AuthenticationType::INVALID: LOG(FATAL) << "invalid authentication negotiated";
     }
-    */
   }
 }
 
@@ -320,11 +358,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::NONE,
             {},
             false,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::NONE,
             {},
             false,
+            RpcEncryption::OPTIONAL,
           },
           false,
           Status::NotAuthorized(".*client is not configured with an authentication type"),
@@ -341,11 +381,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::NONE,
             { SaslMechanism::PLAIN },
             false,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::NONE,
             {},
             false,
+            RpcEncryption::OPTIONAL,
           },
           false,
           Status::NotAuthorized(".* server mechanism list is empty"),
@@ -362,11 +404,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::NONE,
             { SaslMechanism::PLAIN },
             false,
+            RpcEncryption::OPTIONAL
           },
           EndpointConfig {
             PkiConfig::NONE,
             { SaslMechanism::PLAIN },
             false,
+            RpcEncryption::DISABLED,
           },
           false,
           Status::OK(),
@@ -383,11 +427,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::NONE,
             { SaslMechanism::GSSAPI },
             false,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::NONE,
             { SaslMechanism::GSSAPI },
             false,
+            RpcEncryption::DISABLED,
           },
           false,
           Status::OK(),
@@ -404,11 +450,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::NONE,
             { SaslMechanism::GSSAPI, SaslMechanism::PLAIN },
             false,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::NONE,
             { SaslMechanism::GSSAPI, SaslMechanism::PLAIN },
             false,
+            RpcEncryption::DISABLED,
           },
           false,
           Status::OK(),
@@ -425,11 +473,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::NONE,
             { SaslMechanism::GSSAPI, SaslMechanism::PLAIN },
             false,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::NONE,
             { SaslMechanism::GSSAPI },
             false,
+            RpcEncryption::DISABLED,
           },
           false,
           Status::OK(),
@@ -446,11 +496,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::NONE,
             { SaslMechanism::PLAIN },
             false,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::NONE,
             { SaslMechanism::GSSAPI },
             false,
+            RpcEncryption::DISABLED,
           },
           false,
           Status::NotAuthorized(".*client does not have Kerberos enabled"),
@@ -468,11 +520,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::NONE,
             { SaslMechanism::GSSAPI },
             false,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::SELF_SIGNED,
             { SaslMechanism::GSSAPI },
             false,
+            RpcEncryption::OPTIONAL,
           },
           true,
           Status::OK(),
@@ -491,11 +545,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::SIGNED,
             { SaslMechanism::GSSAPI },
             false,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::SELF_SIGNED,
             { SaslMechanism::GSSAPI },
             false,
+            RpcEncryption::OPTIONAL,
           },
           false,
           Status::OK(),
@@ -512,11 +568,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::NONE,
             { SaslMechanism::PLAIN },
             false,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::SELF_SIGNED,
             { SaslMechanism::PLAIN },
             false,
+            RpcEncryption::OPTIONAL,
           },
           false,
           Status::OK(),
@@ -533,11 +591,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::SIGNED,
             { SaslMechanism::GSSAPI },
             false,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::SIGNED,
             { SaslMechanism::GSSAPI },
             false,
+            RpcEncryption::OPTIONAL,
           },
           false,
           Status::OK(),
@@ -554,11 +614,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::TRUSTED,
             { },
             true,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::SIGNED,
             { SaslMechanism::PLAIN },
             true,
+            RpcEncryption::OPTIONAL,
           },
           false,
           Status::OK(),
@@ -578,11 +640,13 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::NONE,
             { SaslMechanism::PLAIN },
             true,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::SIGNED,
             { SaslMechanism::PLAIN },
             true,
+            RpcEncryption::OPTIONAL,
           },
           false,
           Status::OK(),
@@ -599,17 +663,203 @@ INSTANTIATE_TEST_CASE_P(NegotiationCombinations,
             PkiConfig::SIGNED,
             { SaslMechanism::PLAIN, SaslMechanism::GSSAPI },
             true,
+            RpcEncryption::OPTIONAL,
           },
           EndpointConfig {
             PkiConfig::SIGNED,
             { SaslMechanism::PLAIN, SaslMechanism::GSSAPI },
             true,
+            RpcEncryption::OPTIONAL,
           },
           false,
           Status::OK(),
           Status::OK(),
           AuthenticationType::CERTIFICATE,
           SaslMechanism::INVALID,
+          true,
+        },
+
+        // client: PLAIN, TLS disabled
+        // server: PLAIN, TLS required
+        NegotiationDescriptor {
+          EndpointConfig {
+            PkiConfig::NONE,
+            { SaslMechanism::PLAIN },
+            false,
+            RpcEncryption::DISABLED,
+          },
+          EndpointConfig {
+            PkiConfig::SIGNED,
+            { SaslMechanism::PLAIN },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          false,
+          Status::NotAuthorized(".*client does not support required TLS encryption"),
+          Status::NotAuthorized(".*client does not support required TLS encryption"),
+          AuthenticationType::SASL,
+          SaslMechanism::PLAIN,
+          true,
+        },
+
+        // client: PLAIN, TLS required
+        // server: PLAIN, TLS disabled
+        NegotiationDescriptor {
+          EndpointConfig {
+            PkiConfig::NONE,
+            { SaslMechanism::PLAIN },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          EndpointConfig {
+            PkiConfig::SIGNED,
+            { SaslMechanism::PLAIN },
+            false,
+            RpcEncryption::DISABLED,
+          },
+          false,
+          Status::NotAuthorized(".*server does not support required TLS encryption"),
+          Status::NetworkError(""),
+          AuthenticationType::SASL,
+          SaslMechanism::PLAIN,
+          true,
+        },
+
+        // client: GSSAPI, TLS required, externally-signed cert
+        // server: GSSAPI, TLS required, externally-signed cert
+        NegotiationDescriptor {
+          EndpointConfig {
+            PkiConfig::EXTERNALLY_SIGNED,
+            { SaslMechanism::GSSAPI },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          EndpointConfig {
+            PkiConfig::EXTERNALLY_SIGNED,
+            { SaslMechanism::GSSAPI },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          false,
+          Status::OK(),
+          Status::OK(),
+          AuthenticationType::SASL,
+          SaslMechanism::GSSAPI,
+          true,
+        },
+
+        // client: GSSAPI, TLS optional, externally-signed cert
+        // server: GSSAPI, TLS required, signed cert
+        NegotiationDescriptor {
+          EndpointConfig {
+            PkiConfig::EXTERNALLY_SIGNED,
+            { SaslMechanism::GSSAPI },
+            false,
+            RpcEncryption::OPTIONAL,
+          },
+          EndpointConfig {
+            PkiConfig::SIGNED,
+            { SaslMechanism::GSSAPI },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          false,
+          Status::OK(),
+          Status::OK(),
+          AuthenticationType::SASL,
+          SaslMechanism::GSSAPI,
+          true,
+        },
+
+        // client: GSSAPI, TLS required
+        // server: GSSAPI, TLS required, externally-signed cert
+        NegotiationDescriptor {
+          EndpointConfig {
+            PkiConfig::NONE,
+            { SaslMechanism::GSSAPI },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          EndpointConfig {
+            PkiConfig::EXTERNALLY_SIGNED,
+            { SaslMechanism::GSSAPI },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          false,
+          Status::OK(),
+          Status::OK(),
+          AuthenticationType::SASL,
+          SaslMechanism::GSSAPI,
+          true,
+        },
+
+        // client: GSSAPI, PLAIN, TLS required, externally-signed cert
+        // server: PLAIN, TLS required, externally-signed cert
+        NegotiationDescriptor {
+          EndpointConfig {
+            PkiConfig::EXTERNALLY_SIGNED,
+            { SaslMechanism::GSSAPI, SaslMechanism::PLAIN },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          EndpointConfig {
+            PkiConfig::EXTERNALLY_SIGNED,
+            { SaslMechanism::PLAIN },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          false,
+          Status::OK(),
+          Status::OK(),
+          AuthenticationType::SASL,
+          SaslMechanism::PLAIN,
+          true,
+        },
+
+        // client: GSSAPI, TLS disabled, signed cert
+        // server: GSSAPI, TLS required, externally-signed cert
+        NegotiationDescriptor {
+          EndpointConfig {
+            PkiConfig::SIGNED,
+            { SaslMechanism::GSSAPI },
+            false,
+            RpcEncryption::DISABLED,
+          },
+          EndpointConfig {
+            PkiConfig::EXTERNALLY_SIGNED,
+            { SaslMechanism::GSSAPI },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          false,
+          Status::NotAuthorized(".*client does not support required TLS encryption"),
+          Status::NotAuthorized(".*client does not support required TLS encryption"),
+          AuthenticationType::SASL,
+          SaslMechanism::GSSAPI,
+          true,
+        },
+
+        // client: GSSAPI, TLS required, signed cert
+        // server: GSSAPI, TLS required, externally-signed cert
+        NegotiationDescriptor {
+          EndpointConfig {
+            PkiConfig::SIGNED,
+            { SaslMechanism::GSSAPI },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          EndpointConfig {
+            PkiConfig::EXTERNALLY_SIGNED,
+            { SaslMechanism::GSSAPI },
+            false,
+            RpcEncryption::REQUIRED,
+          },
+          false,
+          Status::OK(),
+          Status::OK(),
+          AuthenticationType::SASL,
+          SaslMechanism::GSSAPI,
           true,
         }
 ));
@@ -663,7 +913,8 @@ static void RunGSSAPINegotiationServer(unique_ptr<Socket> socket,
   TlsContext tls_context;
   CHECK_OK(tls_context.Init());
   TokenVerifier token_verifier;
-  ServerNegotiation server_negotiation(std::move(socket), &tls_context, &token_verifier);
+  ServerNegotiation server_negotiation(std::move(socket), &tls_context,
+                                       &token_verifier, RpcEncryption::OPTIONAL);
   server_negotiation.set_server_fqdn("127.0.0.1");
   CHECK_OK(server_negotiation.EnableGSSAPI());
   post_check(server_negotiation.Negotiate(), server_negotiation);
@@ -675,7 +926,8 @@ static void RunGSSAPINegotiationClient(unique_ptr<Socket> conn,
                                        const CheckerFunction<ClientNegotiation>& post_check) {
   TlsContext tls_context;
   CHECK_OK(tls_context.Init());
-  ClientNegotiation client_negotiation(std::move(conn), &tls_context, boost::none);
+  ClientNegotiation client_negotiation(std::move(conn), &tls_context,
+                                       boost::none, RpcEncryption::OPTIONAL);
   client_negotiation.set_server_fqdn("127.0.0.1");
   CHECK_OK(client_negotiation.EnableGSSAPI());
   post_check(client_negotiation.Negotiate(), client_negotiation);
@@ -730,7 +982,8 @@ TEST_F(TestNegotiation, TestGSSAPIInvalidNegotiation) {
                 [](const Status& s, ClientNegotiation& client) {
                   CHECK(s.IsNotAuthorized());
 #ifndef KRB5_VERSION_LE_1_10
-                  CHECK_EQ(s.message().ToString(), "No Kerberos credentials available");
+                  ASSERT_STR_MATCHES(s.ToString(),
+                                     "Not authorized: No Kerberos credentials available.*");
 #endif
                 }));
 
@@ -815,7 +1068,8 @@ static void RunTimeoutExpectingServer(unique_ptr<Socket> socket) {
   TlsContext tls_context;
   CHECK_OK(tls_context.Init());
   TokenVerifier token_verifier;
-  ServerNegotiation server_negotiation(std::move(socket), &tls_context, &token_verifier);
+  ServerNegotiation server_negotiation(std::move(socket), &tls_context,
+                                       &token_verifier, RpcEncryption::OPTIONAL);
   CHECK_OK(server_negotiation.EnablePlain());
   Status s = server_negotiation.Negotiate();
   ASSERT_TRUE(s.IsNetworkError()) << "Expected client to time out and close the connection. Got: "
@@ -825,7 +1079,8 @@ static void RunTimeoutExpectingServer(unique_ptr<Socket> socket) {
 static void RunTimeoutNegotiationClient(unique_ptr<Socket> sock) {
   TlsContext tls_context;
   CHECK_OK(tls_context.Init());
-  ClientNegotiation client_negotiation(std::move(sock), &tls_context, boost::none);
+  ClientNegotiation client_negotiation(std::move(sock), &tls_context,
+                                       boost::none, RpcEncryption::OPTIONAL);
   CHECK_OK(client_negotiation.EnablePlain("test", "test"));
   MonoTime deadline = MonoTime::Now() - MonoDelta::FromMilliseconds(100L);
   client_negotiation.set_deadline(deadline);
@@ -845,7 +1100,8 @@ static void RunTimeoutNegotiationServer(unique_ptr<Socket> socket) {
   TlsContext tls_context;
   CHECK_OK(tls_context.Init());
   TokenVerifier token_verifier;
-  ServerNegotiation server_negotiation(std::move(socket), &tls_context, &token_verifier);
+  ServerNegotiation server_negotiation(std::move(socket), &tls_context,
+                                       &token_verifier, RpcEncryption::OPTIONAL);
   CHECK_OK(server_negotiation.EnablePlain());
   MonoTime deadline = MonoTime::Now() - MonoDelta::FromMilliseconds(100L);
   server_negotiation.set_deadline(deadline);
@@ -857,7 +1113,8 @@ static void RunTimeoutNegotiationServer(unique_ptr<Socket> socket) {
 static void RunTimeoutExpectingClient(unique_ptr<Socket> socket) {
   TlsContext tls_context;
   CHECK_OK(tls_context.Init());
-  ClientNegotiation client_negotiation(std::move(socket), &tls_context, boost::none);
+  ClientNegotiation client_negotiation(std::move(socket), &tls_context,
+                                       boost::none, RpcEncryption::OPTIONAL);
   CHECK_OK(client_negotiation.EnablePlain("test", "test"));
   Status s = client_negotiation.Negotiate();
   ASSERT_TRUE(s.IsNetworkError()) << "Expected server to time out and close the connection. Got: "

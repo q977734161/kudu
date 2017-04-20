@@ -21,7 +21,8 @@ PROTOBUF_GENERATE_CPP(
   BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
   PROTO_FILES client.proto)
 set(CLIENT_PROTO_LIBS
-  kudu_common_proto)
+  kudu_common_proto
+  token_proto)
 ADD_EXPORTABLE_LIBRARY(client_proto
   SRCS ${CLIENT_PROTO_SRCS}
   DEPS ${CLIENT_PROTO_LIBS}
@@ -36,6 +37,7 @@ set(CLIENT_SRCS
   error-internal.cc
   master_rpc.cc
   meta_cache.cc
+  partitioner-internal.cc
   scan_batch.cc
   scan_configuration.cc
   scan_predicate.cc
@@ -117,7 +119,7 @@ ADD_EXPORTABLE_LIBRARY(kudu_client
 # For a detailed explanation of the kinds of C++ changes that would break ABI
 # compatibility, see:
 #
-#   https://techbase.kde.org/Policies/Binary_Compatibility_Issues_With_C++
+#   https://community.kde.org/Policies/Binary_Compatibility_Issues_With_C++
 #
 # For more background on library versions, see:
 #

@@ -50,6 +50,10 @@ namespace tablet {
 
 namespace {
 
+// The maximum number of rows we will output at a time during
+// compaction.
+const int kCompactionOutputBlockNumRows = 100;
+
 // Advances to the last mutation in a mutation list.
 void AdvanceToLastInList(const Mutation** m) {
   if (*m == nullptr) return;
@@ -1057,7 +1061,7 @@ Status FlushCompactionInput(CompactionInput* input,
 
   DCHECK(out->schema().has_column_ids());
 
-  RowBlock block(out->schema(), 100, nullptr);
+  RowBlock block(out->schema(), kCompactionOutputBlockNumRows, nullptr);
 
   while (input->HasMoreBlocks()) {
     RETURN_NOT_OK(input->PrepareBlock(&rows));
@@ -1131,6 +1135,7 @@ Status FlushCompactionInput(CompactionInput* input,
     if (n > 0) {
       block.Resize(n);
       RETURN_NOT_OK(out->AppendBlock(block));
+      block.Resize(block.row_capacity());
     }
 
     RETURN_NOT_OK(input->FinishBlock());

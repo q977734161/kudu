@@ -27,7 +27,6 @@
 #include "kudu/util/logging_test_util.h"
 #include "kudu/util/test_util.h"
 
-DECLARE_bool(log_redact_user_data);
 DECLARE_bool(never_fsync);
 
 DEFINE_int32(flag_with_no_tags, 0, "test flag that has no tags");
@@ -121,7 +120,7 @@ TEST_F(FlagTagsTest, TestUnlockFlags) {
 TEST_F(FlagTagsTest, TestSensitiveFlags) {
   // Setting a sensitive flag should return a redacted value.
   {
-    ASSERT_STR_CONTAINS(CommandlineFlagsIntoString(), strings::Substitute(
+    ASSERT_STR_CONTAINS(CommandlineFlagsIntoString(EscapeMode::NONE), strings::Substitute(
                         "--test_sensitive_flag=$0", kRedactionMessage));
   }
 }

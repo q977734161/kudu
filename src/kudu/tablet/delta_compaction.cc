@@ -18,6 +18,7 @@
 #include "kudu/tablet/delta_compaction.h"
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -247,7 +248,7 @@ Status MajorDeltaCompaction::OpenBaseDataWriter() {
 }
 
 Status MajorDeltaCompaction::OpenRedoDeltaFileWriter() {
-  gscoped_ptr<WritableBlock> block;
+  unique_ptr<WritableBlock> block;
   RETURN_NOT_OK_PREPEND(fs_manager_->CreateNewBlock(&block),
                         "Unable to create REDO delta output block");
   new_redo_delta_block_ = block->id();
@@ -256,7 +257,7 @@ Status MajorDeltaCompaction::OpenRedoDeltaFileWriter() {
 }
 
 Status MajorDeltaCompaction::OpenUndoDeltaFileWriter() {
-  gscoped_ptr<WritableBlock> block;
+  unique_ptr<WritableBlock> block;
   RETURN_NOT_OK_PREPEND(fs_manager_->CreateNewBlock(&block),
                         "Unable to create UNDO delta output block");
   new_undo_delta_block_ = block->id();
@@ -306,7 +307,7 @@ Status MajorDeltaCompaction::CreateMetadataUpdate(
   }
 
   // Replace old column blocks with new ones
-  RowSetMetadata::ColumnIdToBlockIdMap new_column_blocks;
+  std::map<ColumnId, BlockId> new_column_blocks;
   base_data_writer_->GetFlushedBlocksByColumnId(&new_column_blocks);
 
   // NOTE: in the case that one of the columns being compacted is deleted,

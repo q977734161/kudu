@@ -35,6 +35,7 @@
 #include "kudu/util/env.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/path_util.h"
+#include "kudu/util/stopwatch.h"
 #include "kudu/util/subprocess.h"
 #include "kudu/util/test_util.h"
 
@@ -139,10 +140,12 @@ Status GetBinaryPath(const string& binary, string* path) {
 
 
 Status MiniKdc::Start() {
+  SCOPED_LOG_SLOW_EXECUTION(WARNING, 100, "starting KDC");
   CHECK(!kdc_process_);
   VLOG(1) << "Starting Kerberos KDC: " << options_.ToString();
 
   if (!Env::Default()->FileExists(options_.data_root)) {
+    VLOG(1) << "Creating KDC database and configuration files";
     RETURN_NOT_OK(Env::Default()->CreateDir(options_.data_root));
 
     RETURN_NOT_OK(CreateKdcConf());
@@ -172,10 +175,13 @@ Status MiniKdc::Start() {
 
   RETURN_NOT_OK(kdc_process_->Start());
 
-  // If we asked for an ephemeral port, grab the actual ports and
-  // rewrite the configuration so that clients can connect.
-  if (options_.port == 0) {
-    RETURN_NOT_OK(WaitForKdcPorts());
+  const bool need_config_update = (options_.port == 0);
+  // Wait for KDC to start listening on its ports and commencing operation.
+  RETURN_NOT_OK(WaitForKdcPorts());
+
+  if (need_config_update) {
+    // If we asked for an ephemeral port, grab the actual ports and
+    // rewrite the configuration so that clients can connect.
     RETURN_NOT_OK(CreateKrb5Conf());
     RETURN_NOT_OK(CreateKdcConf());
   }
@@ -198,6 +204,7 @@ Status MiniKdc::CreateKdcConf() const {
   static const string kFileTemplate = R"(
 [kdcdefaults]
 kdc_ports = $2
+kdc_tcp_ports = ""
 
 [realms]
 $1 = {
@@ -218,7 +225,7 @@ $1 = {
 Status MiniKdc::CreateKrb5Conf() const {
   static const string kFileTemplate = R"(
 [logging]
-    kdc = STDERR
+    kdc = FILE:/dev/stderr
 
 [libdefaults]
     default_realm = $1
@@ -240,6 +247,11 @@ Status MiniKdc::CreateKrb5Conf() const {
 [realms]
     $1 = {
         kdc = 127.0.0.1:$0
+        # This super-arcane syntax can be found documented in various Hadoop
+        # vendors' security guides and very briefly in the MIT krb5 docs.
+        # Basically, this one says to map anyone coming in as foo@OTHERREALM.COM
+        # and map them to a local user 'other-foo'
+        auth_to_local = RULE:[1:other-$$1@$$0](.*@OTHERREALM.COM$$)s/@.*//
     }
   )";
   string file_contents = strings::Substitute(kFileTemplate, options_.port, options_.realm,
@@ -249,6 +261,7 @@ Status MiniKdc::CreateKrb5Conf() const {
 }
 
 Status MiniKdc::WaitForKdcPorts() {
+  SCOPED_LOG_SLOW_EXECUTION(WARNING, 100, Substitute("waiting for KDC ports"));
   // We have to use 'lsof' to figure out which ports the KDC bound to if we
   // requested ephemeral ones. The KDC doesn't log the bound port or expose it
   // in any other fashion, and re-implementing lsof involves parsing a lot of
@@ -259,7 +272,7 @@ Status MiniKdc::WaitForKdcPorts() {
   string lsof;
   RETURN_NOT_OK(GetBinaryPath("lsof", {"/sbin", "/usr/sbin"}, &lsof));
 
-  vector<string> cmd = {
+  const vector<string> cmd = {
     lsof, "-wbnP", "-Ffn",
     "-p", std::to_string(kdc_process_->pid()),
     "-a", "-i", "4UDP"};
@@ -296,12 +309,20 @@ Status MiniKdc::WaitForKdcPorts() {
   }
   CHECK(port > 0 && port < std::numeric_limits<uint16_t>::max())
       << "parsed invalid port: " << port;
-  options_.port = port;
-  VLOG(1) << "Determined bound KDC port: " << options_.port;
+  VLOG(1) << "Determined bound KDC port: " << port;
+  if (options_.port == 0) {
+    options_.port = port;
+  } else {
+    // Sanity check: if KDC's port is already established, it's supposed to be
+    // written into the configuration files, so the process must bind to the
+    // already established port.
+    CHECK(options_.port == port);
+  }
   return Status::OK();
 }
 
 Status MiniKdc::CreateUserPrincipal(const string& username) {
+  SCOPED_LOG_SLOW_EXECUTION(WARNING, 100, Substitute("creating user principal $0", username));
   string kadmin;
   RETURN_NOT_OK(GetBinaryPath("kadmin.local", &kadmin));
   RETURN_NOT_OK(Subprocess::Call(MakeArgv({
@@ -311,6 +332,7 @@ Status MiniKdc::CreateUserPrincipal(const string& username) {
 
 Status MiniKdc::CreateServiceKeytab(const string& spn,
                                     string* path) {
+  SCOPED_LOG_SLOW_EXECUTION(WARNING, 100, Substitute("creating service keytab for $0", spn));
   string kt_path = spn;
   StripString(&kt_path, "/", '_');
   kt_path = JoinPathSegments(options_.data_root, kt_path) + ".keytab";
@@ -326,13 +348,15 @@ Status MiniKdc::CreateServiceKeytab(const string& spn,
 }
 
 Status MiniKdc::Kinit(const string& username) {
+  SCOPED_LOG_SLOW_EXECUTION(WARNING, 100, Substitute("kinit for $0", username));
   string kinit;
   RETURN_NOT_OK(GetBinaryPath("kinit", &kinit));
-  Subprocess::Call(MakeArgv({ kinit, username }), username);
+  RETURN_NOT_OK(Subprocess::Call(MakeArgv({ kinit, username }), username));
   return Status::OK();
 }
 
 Status MiniKdc::Kdestroy() {
+  SCOPED_LOG_SLOW_EXECUTION(WARNING, 100, "kdestroy");
   string kdestroy;
   RETURN_NOT_OK(GetBinaryPath("kdestroy", &kdestroy));
   return Subprocess::Call(MakeArgv({ kdestroy, "-A" }));

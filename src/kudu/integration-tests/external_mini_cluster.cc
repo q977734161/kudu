@@ -76,7 +76,7 @@ static const char* const kWildcardIpAddr = "0.0.0.0";
 static const char* const kLoopbackIpAddr = "127.0.0.1";
 static double kProcessStartTimeoutSeconds = 30.0;
 static double kTabletServerRegistrationTimeoutSeconds = 15.0;
-static double kMasterCatalogManagerTimeoutSeconds = 30.0;
+static double kMasterCatalogManagerTimeoutSeconds = 60.0;
 
 #if defined(__APPLE__)
 static ExternalMiniClusterOptions::BindMode kBindMode =
@@ -148,10 +148,15 @@ Status ExternalMiniCluster::Start() {
   if (opts_.enable_kerberos) {
     kdc_.reset(new MiniKdc(opts_.mini_kdc_options));
     RETURN_NOT_OK(kdc_->Start());
-    RETURN_NOT_OK_PREPEND(kdc_->CreateUserPrincipal("testuser"),
-                          "could not create client principal");
-    RETURN_NOT_OK_PREPEND(kdc_->Kinit("testuser"),
-                          "could not kinit as client");
+    RETURN_NOT_OK_PREPEND(kdc_->CreateUserPrincipal("test-admin"),
+                          "could not create admin principal");
+    RETURN_NOT_OK_PREPEND(kdc_->CreateUserPrincipal("test-user"),
+                          "could not create user principal");
+    RETURN_NOT_OK_PREPEND(kdc_->CreateUserPrincipal("joe-interloper"),
+                          "could not create unauthorized principal");
+
+    RETURN_NOT_OK_PREPEND(kdc_->Kinit("test-admin"),
+                          "could not kinit as admin");
     RETURN_NOT_OK_PREPEND(kdc_->SetKrb5Environment(),
                           "could not set krb5 client env");
   }
@@ -532,16 +537,16 @@ vector<ExternalDaemon*> ExternalMiniCluster::daemons() const {
   return results;
 }
 
-std::shared_ptr<rpc::Messenger> ExternalMiniCluster::messenger() {
+std::shared_ptr<rpc::Messenger> ExternalMiniCluster::messenger() const {
   return messenger_;
 }
 
-std::shared_ptr<MasterServiceProxy> ExternalMiniCluster::master_proxy() {
+std::shared_ptr<MasterServiceProxy> ExternalMiniCluster::master_proxy() const {
   CHECK_EQ(masters_.size(), 1);
   return master_proxy(0);
 }
 
-std::shared_ptr<MasterServiceProxy> ExternalMiniCluster::master_proxy(int idx) {
+std::shared_ptr<MasterServiceProxy> ExternalMiniCluster::master_proxy(int idx) const {
   CHECK_LT(idx, masters_.size());
   return std::shared_ptr<MasterServiceProxy>(
       new MasterServiceProxy(messenger_, CHECK_NOTNULL(master(idx))->bound_rpc_addr()));
@@ -604,9 +609,11 @@ Status ExternalDaemon::EnableKerberos(MiniKdc* kdc, const string& bind_host) {
   RETURN_NOT_OK_PREPEND(kdc->CreateServiceKeytab(spn, &ktpath),
                         "could not create keytab");
   extra_env_ = kdc->GetEnvVars();
-  extra_flags_.push_back(Substitute("--keytab=$0", ktpath));
-  extra_flags_.push_back(Substitute("--kerberos_principal=$0", spn));
-  extra_flags_.push_back("--server_require_kerberos");
+  extra_flags_.push_back(Substitute("--keytab_file=$0", ktpath));
+  extra_flags_.push_back(Substitute("--principal=$0", spn));
+  extra_flags_.push_back("--rpc_authentication=required");
+  extra_flags_.push_back("--superuser_acl=test-admin");
+  extra_flags_.push_back("--user_acl=test-user");
   return Status::OK();
 }
 
@@ -627,14 +634,19 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
   // Generate smaller RSA keys -- generating a 1024-bit key is faster
   // than generating the default 2048-bit key, and we don't care about
   // strong encryption in tests. Setting it lower (e.g. 512 bits) results
-  // in OpenSSL errors RSA_sign:digest too big for rsa key:rsa_sign.c:122.
+  // in OpenSSL errors RSA_sign:digest too big for rsa key:rsa_sign.c:122
+  // since we are using strong/high TLS v1.2 cipher suites, so the minimum
+  // size of TLS-related RSA key is 768 bits (due to the usage of
+  // the ECDHE-RSA-AES256-GCM-SHA384 suite). However, to work with Java
+  // client it's necessary to have at least 1024 bits for certificate RSA key
+  // due to Java security policies.
   argv.push_back("--ipki_server_key_size=1024");
 
   // Disable minidumps by default since many tests purposely inject faults.
   argv.push_back("--enable_minidumps=false");
 
   // Disable log redaction.
-  argv.push_back("--log_redact_user_data=false");
+  argv.push_back("--redact=flag");
 
   // Enable metrics logging.
   argv.push_back("--metrics_log_interval_ms=1000");
@@ -693,11 +705,20 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
       break;
     }
     SleepFor(MonoDelta::FromMilliseconds(10));
-    Status s = p->WaitNoBlock();
+    int wait_status;
+    Status s = p->WaitNoBlock(&wait_status);
     if (s.IsTimedOut()) {
       // The process is still running.
       continue;
     }
+
+    // If the process exited with expected exit status we need to still swap() the process
+    // and exit as if it had succeeded.
+    if (WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == fault_injection::kExitStatus) {
+      process_.swap(p);
+      return Status::OK();
+    }
+
     RETURN_NOT_OK_PREPEND(s, Substitute("Failed waiting on $0", exe_));
     string exit_info;
     RETURN_NOT_OK(p->GetExitStatus(nullptr, &exit_info));
@@ -903,7 +924,9 @@ Sockaddr ExternalDaemon::bound_rpc_addr() const {
 
 HostPort ExternalDaemon::bound_http_hostport() const {
   CHECK(status_);
-  CHECK_GE(status_->bound_http_addresses_size(), 1);
+  if (status_->bound_http_addresses_size() == 0) {
+    return HostPort();
+  }
   HostPort ret;
   CHECK_OK(HostPortFromPB(status_->bound_http_addresses(0), &ret));
   return ret;
@@ -924,6 +947,7 @@ Status ExternalDaemon::GetInt64Metric(const MetricEntityPrototype* entity_proto,
                                       const MetricPrototype* metric_proto,
                                       const char* value_field,
                                       int64_t* value) const {
+  CHECK(bound_http_hostport().Initialized());
   // Fetch metrics whose name matches the given prototype.
   string url = Substitute(
       "http://$0/jsonmetricz?metrics=$1",
@@ -1009,18 +1033,10 @@ ExternalMaster::~ExternalMaster() {
 }
 
 Status ExternalMaster::Start() {
-  vector<string> flags;
-
-  // Generate smaller RSA keys. See note above for server_rsa_key_length_bits.
-  flags.push_back("--ipki_ca_key_size=1024");
-
-  flags.push_back("--fs_wal_dir=" + data_dir_);
-  flags.push_back("--fs_data_dirs=" + data_dir_);
-  flags.push_back("--rpc_bind_addresses=" + get_rpc_bind_address());
-  flags.push_back("--webserver_interface=localhost");
+  vector<string> flags(GetCommonFlags());
   flags.push_back("--webserver_port=0");
-  RETURN_NOT_OK(StartProcess(flags));
-  return Status::OK();
+  flags.push_back("--rpc_bind_addresses=" + get_rpc_bind_address());
+  return StartProcess(flags);
 }
 
 Status ExternalMaster::Restart() {
@@ -1028,14 +1044,14 @@ Status ExternalMaster::Restart() {
   if (bound_rpc_.port() == 0) {
     return Status::IllegalState("Master cannot be restarted. Must call Shutdown() first.");
   }
-  vector<string> flags;
-  flags.push_back("--fs_wal_dir=" + data_dir_);
-  flags.push_back("--fs_data_dirs=" + data_dir_);
+
+  vector<string> flags(GetCommonFlags());
+  if (bound_http_.Initialized()) {
+    flags.push_back(Substitute("--webserver_port=$0", bound_http_.port()));
+  }
   flags.push_back("--rpc_bind_addresses=" + bound_rpc_.ToString());
-  flags.push_back("--webserver_interface=localhost");
-  flags.push_back(Substitute("--webserver_port=$0", bound_http_.port()));
-  RETURN_NOT_OK(StartProcess(flags));
-  return Status::OK();
+
+  return StartProcess(flags);
 }
 
 Status ExternalMaster::WaitForCatalogManager() {
@@ -1078,6 +1094,22 @@ Status ExternalMaster::WaitForCatalogManager() {
                    bound_rpc_addr().ToString()));
   }
   return Status::OK();
+}
+
+vector<string> ExternalMaster::GetCommonFlags() const {
+  return {
+    "--fs_wal_dir=" + data_dir_,
+    "--fs_data_dirs=" + data_dir_,
+    "--webserver_interface=localhost",
+
+    // See the in-line comment for "--ipki_server_key_size" flag in
+    // ExternalDaemon::StartProcess() method.
+    "--ipki_ca_key_size=1024",
+
+    // As for the TSK keys, 512 bits is the minimum since we are using the SHA256
+    // digest for token signing/verification.
+    "--tsk_num_rsa_bits=512",
+  };
 }
 
 
@@ -1123,12 +1155,13 @@ Status ExternalTabletServer::Restart() {
   flags.push_back("--rpc_bind_addresses=" + bound_rpc_.ToString());
   flags.push_back(Substitute("--local_ip_for_outbound_sockets=$0",
                              get_rpc_bind_address()));
-  flags.push_back(Substitute("--webserver_port=$0", bound_http_.port()));
-  flags.push_back(Substitute("--webserver_interface=$0",
-                             bound_http_.host()));
+  if (bound_http_.Initialized()) {
+    flags.push_back(Substitute("--webserver_port=$0", bound_http_.port()));
+    flags.push_back(Substitute("--webserver_interface=$0",
+                               bound_http_.host()));
+  }
   flags.push_back("--tserver_master_addrs=" + master_addrs_);
-  RETURN_NOT_OK(StartProcess(flags));
-  return Status::OK();
+  return StartProcess(flags);
 }
 
 

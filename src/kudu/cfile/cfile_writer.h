@@ -18,9 +18,11 @@
 #ifndef KUDU_CFILE_CFILE_WRITER_H
 #define KUDU_CFILE_CFILE_WRITER_H
 
-#include <unordered_map>
 #include <stdint.h>
+
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -95,7 +97,7 @@ class CFileWriter {
   explicit CFileWriter(const WriterOptions &options,
                        const TypeInfo* typeinfo,
                        bool is_nullable,
-                       gscoped_ptr<fs::WritableBlock> block);
+                       std::unique_ptr<fs::WritableBlock> block);
   ~CFileWriter();
 
   Status Start();
@@ -148,7 +150,12 @@ class CFileWriter {
 
   // Return the amount of data written so far to this CFile.
   // More data may be written by Finish(), but this is an approximation.
-  size_t written_size() const;
+  size_t written_size() const {
+    // This is a low estimate, but that's OK -- this is checked after every block
+    // write during flush/compact, so better to give a fast slightly-inaccurate result
+    // than spend a lot of effort trying to improve accuracy by a few KB.
+    return off_;
+  }
 
   // Return the number of values written to the file.
   // This includes NULL cells, but does not include any "raw" blocks
@@ -186,7 +193,7 @@ class CFileWriter {
   void FlushMetadataToPB(google::protobuf::RepeatedPtrField<FileMetadataPairPB> *field);
 
   // Block being written.
-  gscoped_ptr<fs::WritableBlock> block_;
+  std::unique_ptr<fs::WritableBlock> block_;
 
   // Current file offset.
   uint64_t off_;
